@@ -1,0 +1,449 @@
+---
+# Windows Post-Migration Validation Playbook
+# Run after virt-v2v conversion once the Windows VM has booted on KVM/OpenShift Virtualization.
+# Requires WinRM access to the target VM. Set connection parameters in inventory
+# or group_vars (ansible_connection: winrm, ansible_winrm_transport, etc.).
+- name: Post-migration validation for Windows VM on KVM/OpenShift Virtualization
+  hosts: all
+  gather_facts: false
+  ignore_unreachable: true
+
+  tasks:
+    - name: Gather Facts
+      ansible.builtin.setup:
+
+    - name: Gather Services
+      ansible.builtin.service_facts:
+
+    - name: INFO OS
+      ansible.builtin.debug:
+        msg: "{{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}"
+
+    - name: Assert preflight requirements
+      ansible.builtin.assert:
+        that:
+          - ansible_version.full is version('2.14', '>=')
+          - ansible_facts['os_family'] == 'Windows'
+        fail_msg: >-
+          Preflight assertion failed.
+          Ansible >= 2.14 required (found {{ ansible_version.full }}).
+          OS family must be Windows (found {{ ansible_facts['os_family'] }}).
+        success_msg: >-
+          Preflight OK — Ansible {{ ansible_version.full }},
+          {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}
+
+    # ============ CRITICAL: Platform must be KVM, not VMware ============
+    # The single most important check — confirms the VM is no longer on VMware.
+
+    - name: Check platform is KVM (not VMware)
+      ansible.windows.win_shell: |
+        (Get-WmiObject Win32_ComputerSystem).Manufacturer
+      changed_when: false
+      ignore_errors: true
+      register: platform_win_check
+      failed_when: "'VMware' in platform_win_check.stdout"
+
+    - name: INFO Detected platform
+      ansible.builtin.debug:
+        msg: "Platform manufacturer: {{ platform_win_check.stdout | trim }}"
+
+    # ============ CRITICAL: VMware kernel modules must be absent ============
+    # Any active VMware drivers indicate an incomplete or failed conversion.
+
+    - name: Check VMware PVSCSI and VMXNET drivers are not active
+      ansible.windows.win_shell: |
+        $drv = Get-WmiObject Win32_PnPSignedDriver -ErrorAction SilentlyContinue |
+          Where-Object { $_.DeviceName -match 'PVSCSI|VMXNET' -and $_.Status -eq 'OK' }
+        if ($drv) { ($drv.DeviceName | Select-Object -Unique) -join ', ' } else { "" }
+      changed_when: false
+      ignore_errors: true
+      register: vmware_drivers_post_check
+      failed_when: vmware_drivers_post_check.stdout | trim | length > 0
+
+    # ============ CRITICAL: virtio-net (NetKVM) driver must be loaded ============
+
+    - name: Check virtio-net (NetKVM) driver is active
+      ansible.windows.win_shell: |
+        $nic = Get-NetAdapter | Where-Object { $_.InterfaceDescription -match 'Red Hat VirtIO' }
+        if ($nic) { $nic.Name -join ', ' } else { "" }
+      changed_when: false
+      ignore_errors: true
+      register: virtio_net_win_check
+      failed_when: virtio_net_win_check.stdout | trim | length == 0
+
+    - name: INFO NIC drivers detected
+      ansible.windows.win_shell: |
+        Get-NetAdapter | ForEach-Object { "$($_.Name): $($_.InterfaceDescription) [$($_.Status)]" }
+      changed_when: false
+      ignore_errors: true
+      register: nic_drivers_info
+
+    - name: INFO NIC driver details
+      ansible.builtin.debug:
+        msg: "{{ nic_drivers_info.stdout_lines }}"
+
+    - name: Gather NIC inventory (Windows)
+      ansible.windows.win_shell: |
+        $nics = Get-NetAdapter | Where-Object { $_.InterfaceType -ne 24 }
+        foreach ($nic in $nics) {
+          $ip = (Get-NetIPAddress -InterfaceIndex $nic.IfIndex -AddressFamily IPv4 `
+            -ErrorAction SilentlyContinue |
+            Where-Object { $_.PrefixOrigin -ne 'WellKnown' } |
+            Select-Object -First 1).IPAddress
+          "$($nic.Name): mac=$($nic.MacAddress) ip=$(if ($ip) { $ip } else { 'no-ip' }) mtu=$($nic.ActiveMaximumTransmissionUnit) [$($nic.InterfaceDescription)]"
+        }
+      changed_when: false
+      ignore_errors: true
+      register: win_nic_inventory
+
+    - name: INFO Network interface count
+      ansible.builtin.debug:
+        msg: "NICs (excluding loopback): {{ win_nic_inventory.stdout_lines | length }}"
+
+    - name: INFO NIC details
+      ansible.builtin.debug:
+        msg: "{{ win_nic_inventory.stdout_lines }}"
+
+    - name: Warn if multiple NICs detected
+      ansible.builtin.debug:
+        msg: "WARNING: {{ win_nic_inventory.stdout_lines | length }} NICs detected — ensure all are mapped to target networks in KubeVirt VM spec"
+      when: win_nic_inventory.stdout_lines | length > 1
+      changed_when: false
+
+    # ============ CRITICAL: virtio storage driver must be loaded ============
+
+    - name: Check virtio storage driver (vioscsi or viostor) is active
+      ansible.windows.win_shell: |
+        $drv = Get-WmiObject Win32_PnPSignedDriver -ErrorAction SilentlyContinue |
+          Where-Object { $_.DeviceName -match 'VirtIO SCSI|VirtIO Block|Red Hat VirtIO SCSI' }
+        if ($drv) { ($drv.DeviceName | Select-Object -Unique) -join ', ' } else { "" }
+      changed_when: false
+      ignore_errors: true
+      register: virtio_storage_win_check
+      failed_when: virtio_storage_win_check.stdout | trim | length == 0
+
+    - name: INFO Disk devices detected
+      ansible.windows.win_shell: |
+        Get-Disk | ForEach-Object {
+          "Disk $($_.Number): $([math]::Round($_.Size/1GB,1)) GB — $($_.PartitionStyle)"
+        }
+      changed_when: false
+      ignore_errors: true
+      register: disk_info_post
+
+    - name: INFO Disk details
+      ansible.builtin.debug:
+        msg: "{{ disk_info_post.stdout_lines }}"
+
+    # ============ CRITICAL: VMware Tools must be uninstalled ============
+
+    - name: Check VMware Tools package is removed
+      ansible.windows.win_shell: |
+        $pkg = Get-Package -ErrorAction SilentlyContinue |
+          Where-Object { $_.Name -match 'VMware Tools' }
+        if ($pkg) { $pkg.Name -join ', ' } else { "" }
+      changed_when: false
+      ignore_errors: true
+      register: vmtools_removed_check
+      failed_when: vmtools_removed_check.stdout | trim | length > 0
+
+    - name: Check VMware Tools service is not running
+      ansible.builtin.debug:
+        msg: "VMTools service state: {{ ansible_facts.services.get('VMTools', {}).get('state', 'absent') }}"
+      failed_when: ansible_facts.services.get('VMTools', {}).get('state') == 'running'
+      changed_when: false
+      ignore_errors: true
+      register: vmtools_svc_post_check
+
+    # ============ CRITICAL: C: drive must be accessible ============
+
+    - name: Check C drive is accessible
+      ansible.windows.win_shell: |
+        if (Test-Path 'C:/') { "ok" } else { "inaccessible" }
+      changed_when: false
+      ignore_errors: true
+      register: c_drive_post_check
+      failed_when: c_drive_post_check.stdout | trim != 'ok'
+
+    # ============ HIGH: QEMU Guest Agent must be installed and running ============
+    # OCP-V uses QEMU Guest Agent for IP reporting, snapshot quiesce,
+    # and live migration coordination.
+
+    - name: Check QEMU Guest Agent service is running
+      ansible.builtin.debug:
+        msg: "QEMU-GA service state: {{ ansible_facts.services.get('QEMU-GA', {}).get('state', 'absent') }}"
+      failed_when: >
+        'QEMU-GA' not in ansible_facts.services or
+        ansible_facts.services['QEMU-GA'].state != 'running'
+      changed_when: false
+      ignore_errors: true
+      register: qga_win_check
+
+    - name: Detect running EDR or AV services
+      ansible.builtin.set_fact:
+        edr_blocking: >-
+          {{
+            ansible_facts.services
+            | dict2items
+            | selectattr('key', 'in', [
+                'CSFalconService',
+                'CbDefense',
+                'CarbonBlack',
+                'SentinelAgent',
+                'CylanceSvc',
+                'SophosMcsAgent',
+                'TmCCSF',
+                'WinDefend'
+              ])
+            | selectattr('value.state', 'equalto', 'running')
+            | map(attribute='key')
+            | list
+          }}
+
+    - name: Check for EDR interference with QEMU Guest Agent
+      ansible.builtin.debug:
+        msg: >-
+          EDR/AV service is likely blocking QEMU-GA: {{ edr_blocking | join(', ') }}.
+          Add qemu-ga.exe to the EDR allow-list or disable tamper protection,
+          then reinstall the MSI and start the QEMU-GA service.
+      failed_when: edr_blocking | length > 0
+      changed_when: false
+      ignore_errors: true
+      register: edr_blocking_win_check
+      when: qga_win_check is defined and qga_win_check.failed
+
+    # ============ HIGH: No VMware services must be running ============
+
+    - name: Check no VMware services are running
+      ansible.windows.win_shell: |
+        $svcs = Get-Service -ErrorAction SilentlyContinue |
+          Where-Object { $_.Name -match '^VM|VMware|vmtools' -and $_.Status -eq 'Running' }
+        if ($svcs) { $svcs.Name -join ', ' } else { "" }
+      changed_when: false
+      ignore_errors: true
+      register: vmware_svcs_post_check
+      failed_when: vmware_svcs_post_check.stdout | trim | length > 0
+
+    # ============ HIGH: VMware Tools artifacts must be absent ============
+
+    - name: Check VMware Tools binary is absent
+      ansible.windows.win_shell: |
+        if (Test-Path 'C:/Program Files/VMware/VMware Tools') { "found" } else { "" }
+      changed_when: false
+      ignore_errors: true
+      register: vmware_toolsdir_check
+      failed_when: vmware_toolsdir_check.stdout | trim | length > 0
+
+    - name: Check VMware registry keys are absent
+      ansible.windows.win_shell: |
+        if (Test-Path 'HKLM:\SOFTWARE\VMware, Inc.') { "found" } else { "" }
+      changed_when: false
+      ignore_errors: true
+      register: vmware_registry_post_check
+      failed_when: vmware_registry_post_check.stdout | trim | length > 0
+
+    # ============ HIGH: Windows activation status ============
+    # KMS-activated VMs need re-activation after the hypervisor UUID changes.
+
+    - name: Check Windows activation status
+      ansible.windows.win_shell: |
+        $result = cscript //NoLogo "$env:SystemRoot\system32\slmgr.vbs" /dli 2>&1 | Out-String
+        if ($result -match 'License Status: Licensed') { "Licensed" } else { "Not licensed" }
+      changed_when: false
+      ignore_errors: true
+      register: activation_post_check
+      failed_when: activation_post_check.stdout | trim != 'Licensed'
+
+    # ============ HIGH: Network connectivity ============
+
+    - name: Check default route exists
+      ansible.windows.win_shell: |
+        $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue
+        if ($route) { ($route | Select-Object -First 1).NextHop } else { "" }
+      changed_when: false
+      ignore_errors: true
+      register: default_route_win_check
+      failed_when: default_route_win_check.stdout | trim | length == 0
+
+    - name: INFO Default route
+      ansible.builtin.debug:
+        msg: "Default gateway: {{ default_route_win_check.stdout | trim }}"
+
+    - name: Gather IPv4 addresses (Windows)
+      ansible.windows.win_shell: |
+        Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+          Where-Object { $_.PrefixOrigin -ne 'WellKnown' } |
+          ForEach-Object { $_.IPAddress }
+      changed_when: false
+      ignore_errors: true
+      register: win_ipv4_info
+
+    - name: INFO IP addresses
+      ansible.builtin.debug:
+        msg: "{{ win_ipv4_info.stdout_lines }}"
+
+    - name: Check DNS resolution works
+      ansible.windows.win_shell: |
+        try {
+          $ip = Resolve-DnsName $env:COMPUTERNAME -ErrorAction Stop |
+            Select-Object -First 1 -ExpandProperty IPAddress
+          $ip
+        } catch { "" }
+      changed_when: false
+      ignore_errors: true
+      register: dns_win_check
+      failed_when: dns_win_check.stdout | trim | length == 0
+
+    - name: INFO DNS resolution result
+      ansible.builtin.debug:
+        msg: "{{ ansible_hostname }} resolves to: {{ dns_win_check.stdout | trim }}"
+
+    # ============ HIGH: No critical Event Log errors since boot ============
+
+    - name: Check no excess critical errors in System Event Log since boot
+      ansible.windows.win_shell: |
+        try {
+          $boot = (Get-EventLog -LogName System -Source 'Microsoft-Windows-Kernel-General' `
+            -Message '*operating system*' -Newest 1 -ErrorAction Stop).TimeGenerated
+          (Get-EventLog -LogName System -EntryType Error -After $boot -ErrorAction SilentlyContinue |
+            Measure-Object).Count
+        } catch { "0" }
+      changed_when: false
+      ignore_errors: true
+      register: eventlog_check
+      failed_when: eventlog_check.stdout | trim | int > 5
+
+    - name: INFO Event log errors since boot
+      ansible.builtin.debug:
+        msg: "System Event Log errors since last boot: {{ eventlog_check.stdout | trim }}"
+
+    # ============ MEDIUM: Hostname matches inventory ============
+
+    - name: Check hostname matches inventory
+      ansible.builtin.debug:
+        msg: "Hostname mismatch: ansible_hostname={{ ansible_hostname }} inventory={{ inventory_hostname | split('.') | first }}"
+      failed_when: ansible_hostname | lower != (inventory_hostname | split('.') | first | lower)
+      changed_when: false
+      ignore_errors: true
+      register: hostname_win_check
+
+    # ============ MEDIUM: C drive has sufficient free space ============
+
+    - name: Check C drive free space post-migration
+      ansible.windows.win_shell: |
+        $drive = Get-PSDrive C
+        [math]::Round($drive.Free / 1GB, 2)
+      changed_when: false
+      ignore_errors: true
+      register: c_drive_space_post_check
+      failed_when: c_drive_space_post_check.stdout | trim | float < 1
+
+    - name: INFO C drive usage
+      ansible.windows.win_shell: |
+        $drive = Get-PSDrive C
+        "Used: $([math]::Round($drive.Used/1GB,1)) GB  Free: $([math]::Round($drive.Free/1GB,1)) GB"
+      changed_when: false
+      ignore_errors: true
+      register: c_drive_usage_info
+
+    - name: INFO C drive detail
+      ansible.builtin.debug:
+        msg: "{{ c_drive_usage_info.stdout | trim }}"
+
+    # ============ MEDIUM: Time sync is active ============
+
+    - name: Check Windows Time service is running
+      ansible.builtin.debug:
+        msg: "W32Time state: {{ ansible_facts.services.get('W32Time', {}).get('state', 'absent') }}"
+      failed_when: ansible_facts.services.get('W32Time', {}).get('state') != 'running'
+      changed_when: false
+      ignore_errors: true
+      register: time_sync_check
+
+    # ============ MEDIUM: No VMware entries in BCD ============
+
+    - name: Check BCD store has no VMware-specific entries
+      ansible.windows.win_shell: |
+        $bcd = bcdedit /enum all 2>&1 | Out-String
+        if ($bcd -match 'vmware') { "VMware entries found in BCD" } else { "" }
+      changed_when: false
+      ignore_errors: true
+      register: bcd_post_check
+      failed_when: bcd_post_check.stdout | trim | length > 0
+
+    # ============ LOW: virtio-serial device for QEMU Guest Agent channel ============
+
+    - name: Check virtio-serial device exists for QEMU Guest Agent
+      ansible.windows.win_shell: |
+        $dev = Get-WmiObject Win32_PnPEntity -ErrorAction SilentlyContinue |
+          Where-Object { $_.Name -match 'VirtIO Serial|QEMU.*Serial' }
+        if ($dev) { $dev.Name } else { "" }
+      changed_when: false
+      ignore_errors: true
+      register: virtio_serial_win_check
+      failed_when: virtio_serial_win_check.stdout | trim | length == 0
+
+    # ============ LOW: RDP still enabled ============
+
+    - name: Check RDP is still enabled post-migration
+      ansible.windows.win_shell: |
+        $val = (Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server').fDenyTSConnections
+        if ($val -eq 0) { "enabled" } else { "disabled" }
+      changed_when: false
+      ignore_errors: true
+      register: rdp_post_check
+      failed_when: rdp_post_check.stdout | trim == 'disabled'
+
+    # ============ INFO: Windows version ============
+
+    - name: INFO Windows version
+      ansible.builtin.debug:
+        msg: "{{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}"
+
+    # ============ AGGREGATION: Report all failures at the end ============
+
+    - name: Build failed check list
+      ansible.builtin.set_fact:
+        failed_check_list: >-
+          {{
+            [
+              {'label': 'Platform (still VMware)', 'msg': 'Win32_ComputerSystem.Manufacturer still contains VMware — VM is not running on KVM'} if platform_win_check is defined and 'failed' in platform_win_check and platform_win_check.failed else None,
+              {'label': 'VMware drivers active', 'msg': 'VMware PVSCSI/VMXNET drivers still active: ' + (vmware_drivers_post_check.stdout | trim)} if vmware_drivers_post_check is defined and 'failed' in vmware_drivers_post_check and vmware_drivers_post_check.failed else None,
+              {'label': 'virtio-net (NetKVM)', 'msg': 'No Red Hat VirtIO network adapter found — VM has no virtio NIC'} if virtio_net_win_check is defined and 'failed' in virtio_net_win_check and virtio_net_win_check.failed else None,
+              {'label': 'virtio storage driver', 'msg': 'VirtIO SCSI or Block storage driver not found — VM cannot access disk via virtio'} if virtio_storage_win_check is defined and 'failed' in virtio_storage_win_check and virtio_storage_win_check.failed else None,
+              {'label': 'VMware Tools package', 'msg': 'VMware Tools is still installed: ' + (vmtools_removed_check.stdout | trim)} if vmtools_removed_check is defined and 'failed' in vmtools_removed_check and vmtools_removed_check.failed else None,
+              {'label': 'VMware Tools service', 'msg': 'VMware Tools service (VMTools) is still running'} if vmtools_svc_post_check is defined and 'failed' in vmtools_svc_post_check and vmtools_svc_post_check.failed else None,
+              {'label': 'C: drive inaccessible', 'msg': 'C:\\ drive is not accessible — system volume may be unmounted or corrupt'} if c_drive_post_check is defined and 'failed' in c_drive_post_check and c_drive_post_check.failed else None,
+              {'label': 'QEMU Guest Agent', 'msg': 'QEMU Guest Agent (QEMU-GA) is not installed or not running'} if qga_win_check is defined and 'failed' in qga_win_check and qga_win_check.failed else None,
+              {'label': 'EDR blocking QEMU-GA', 'msg': 'EDR/AV service is likely blocking QEMU-GA — add qemu-ga.exe to the allow-list and reinstall: ' + (edr_blocking | join(', '))} if edr_blocking_win_check is defined and 'failed' in edr_blocking_win_check and edr_blocking_win_check.failed else None,
+              {'label': 'VMware services running', 'msg': 'VMware services still running: ' + (vmware_svcs_post_check.stdout | trim)} if vmware_svcs_post_check is defined and 'failed' in vmware_svcs_post_check and vmware_svcs_post_check.failed else None,
+              {'label': 'VMware Tools directory', 'msg': 'C:\\Program Files\\VMware\\VMware Tools directory still present'} if vmware_toolsdir_check is defined and 'failed' in vmware_toolsdir_check and vmware_toolsdir_check.failed else None,
+              {'label': 'VMware registry keys', 'msg': 'VMware registry keys still present at HKLM:\\SOFTWARE\\VMware, Inc.'} if vmware_registry_post_check is defined and 'failed' in vmware_registry_post_check and vmware_registry_post_check.failed else None,
+              {'label': 'Windows activation', 'msg': 'Windows is not in Licensed state — re-activation required (KMS UUID change)'} if activation_post_check is defined and 'failed' in activation_post_check and activation_post_check.failed else None,
+              {'label': 'Default route', 'msg': 'No default route found — network may be misconfigured'} if default_route_win_check is defined and 'failed' in default_route_win_check and default_route_win_check.failed else None,
+              {'label': 'DNS resolution', 'msg': 'Hostname does not resolve — DNS may be broken'} if dns_win_check is defined and 'failed' in dns_win_check and dns_win_check.failed else None,
+              {'label': 'Event log errors', 'msg': 'More than 5 System Event Log errors detected since last boot'} if eventlog_check is defined and 'failed' in eventlog_check and eventlog_check.failed else None,
+              {'label': 'Hostname mismatch', 'msg': 'Hostname does not match inventory'} if hostname_win_check is defined and 'failed' in hostname_win_check and hostname_win_check.failed else None,
+              {'label': 'C: drive space', 'msg': 'C: drive has less than 1 GB free post-migration'} if c_drive_space_post_check is defined and 'failed' in c_drive_space_post_check and c_drive_space_post_check.failed else None,
+              {'label': 'Time sync (W32Time)', 'msg': 'Windows Time service is not running — clock drift will break Kerberos and TLS'} if time_sync_check is defined and 'failed' in time_sync_check and time_sync_check.failed else None,
+              {'label': 'BCD VMware artifacts', 'msg': 'VMware entries found in BCD store — boot configuration may be contaminated'} if bcd_post_check is defined and 'failed' in bcd_post_check and bcd_post_check.failed else None,
+              {'label': 'virtio-serial channel', 'msg': 'VirtIO serial device not found — QEMU Guest Agent communication channel may not function'} if virtio_serial_win_check is defined and 'failed' in virtio_serial_win_check and virtio_serial_win_check.failed else None,
+              {'label': 'RDP disabled', 'msg': 'RDP is disabled — remote access is not available'} if rdp_post_check is defined and 'failed' in rdp_post_check and rdp_post_check.failed else None
+            ] | reject('equalto', None) | list
+          }}
+
+    - name: Report failed post-migration checks
+      ansible.builtin.debug:
+        msg: "{{ item.label }}: {{ item.msg }}"
+      loop: "{{ failed_check_list }}"
+      loop_control:
+        label: "{{ item.label }}"
+      when: failed_check_list | length > 0
+
+    - name: Fail if any post-migration checks failed
+      ansible.builtin.fail:
+        msg: >-
+          Windows post-migration validation failed. One or more checks reported issues above.
+          The VM may not be operating correctly on KVM/OpenShift Virtualization.
+          Please review and remediate all failures before putting the VM into production.
+      when: failed_check_list | length > 0

@@ -1,6 +1,9 @@
 ---
-# No Galaxy collections required.
+# Linux playbooks: no Galaxy collections required.
 # All tasks use ansible.builtin modules shipped with ansible-core >= 2.14.
+#
+# Windows playbooks require:
+#   ansible.windows  — win_shell, win_service_info, win_copy, etc.
 #
 # Install the required Ansible version (recommended):
 #   pipx install ansible-core
@@ -8,7 +11,12 @@
 # Or with pip:
 #   python3 -m pip install --user ansible-core
 #
+# Install Galaxy collections after cloning:
+#   ansible-galaxy collection install -r requirements.yml
+#
 # Optional linting:
 #   python3 -m pip install --user ansible-lint
 
-collections: []
+collections:
+  - name: ansible.windows
+    version: ">=2.0.0"

@@ -851,25 +851,88 @@
       failed_when: qga_repo_debian.stdout | length == 0
       when: ansible_facts['os_family'] == "Debian"
 
+    # ============ HIGH: EDR / AV agent detection ============
+    # EDR agents with tamper protection (CrowdStrike, SentinelOne, Trend Micro DS, etc.)
+    # intercept virt-v2v's driver injection phase via fanotify hooks and can block
+    # qemu-guest-agent installation post-migration via process execution rules.
+    # Before migrating: add qemu-guest-agent to the EDR allow-list or disable tamper
+    # protection for the duration of the conversion and first boot.
+
+    - name: Detect EDR or AV packages
+      ansible.builtin.set_fact:
+        edr_pkgs_found: >-
+          {{
+            ansible_facts['packages'].keys() | list | intersect([
+              'falcon-sensor',
+              'cbsensor',
+              'cb-psc-sensor',
+              'sentinelone-agent',
+              'sentinel_agent',
+              'ds_agent',
+              'sophosavp',
+              'savdi',
+              'mcafee-endpoint-security',
+              'cylance',
+              'trellix-agent'
+            ])
+          }}
+
+    - name: Check for EDR or AV agent packages
+      ansible.builtin.debug:
+        msg: "EDR/AV packages detected: {{ edr_pkgs_found | join(', ') }}"
+      failed_when: edr_pkgs_found | length > 0
+      changed_when: false
+      ignore_errors: true
+      register: edr_pkg_check
+
+    - name: Detect running EDR or AV services
+      ansible.builtin.set_fact:
+        edr_svcs_running: >-
+          {{
+            ansible_facts.services
+            | dict2items
+            | selectattr('key', 'match',
+                '^(falcon-sensor|cbsensor|sentinelone|ds_agent|cylancesvc|sophosavp|trellix)')
+            | selectattr('value.state', 'equalto', 'running')
+            | map(attribute='key')
+            | list
+          }}
+
+    - name: Check for EDR or AV agent services
+      ansible.builtin.debug:
+        msg: "EDR/AV services active: {{ edr_svcs_running | join(', ') }}"
+      failed_when: edr_svcs_running | length > 0
+      changed_when: false
+      ignore_errors: true
+      register: edr_svc_check
+
     # ============ MEDIUM: Multiple NICs ============
     # VMs with 2+ NICs require explicit NIC-to-network mapping in the KubeVirt VM spec.
     # Unplanned interfaces will go offline post-migration without manual mapping.
 
-    - name: Check number of network interfaces
-      ansible.builtin.shell: |
-        ip -o link show | grep -v ' lo:' | wc -l
-      changed_when: false
-      ignore_errors: true
-      register: nic_count_check
-
     - name: INFO Network interface count
       ansible.builtin.debug:
-        msg: "NIC count (excluding loopback): {{ nic_count_check.stdout.strip() }}"
+        msg: "NICs (excluding loopback): {{ non_lo_ifaces | length }} — {{ non_lo_ifaces | join(', ') }}"
+      vars:
+        non_lo_ifaces: "{{ ansible_facts['interfaces'] | reject('equalto', 'lo') | list }}"
+
+    - name: INFO NIC details
+      ansible.builtin.debug:
+        msg: >-
+          {{ item }}: mac={{ ansible_facts[item]['macaddress'] | default('n/a') }}
+          ip={{ ansible_facts[item].get('ipv4', {}).get('address', 'no-ip') }}
+          driver={{ ansible_facts[item]['module'] | default('unknown') }}
+          mtu={{ ansible_facts[item]['mtu'] | default('n/a') }}
+      loop: "{{ ansible_facts['interfaces'] | reject('equalto', 'lo') | list }}"
 
     - name: Warn if multiple NICs detected
       ansible.builtin.debug:
-        msg: "WARNING: {{ nic_count_check.stdout.strip() }} NICs detected — ensure all are mapped to target networks in KubeVirt VM spec"
-      when: nic_count_check.stdout.strip() | int > 1
+        msg: >-
+          WARNING: {{ non_lo_ifaces | length }} NICs detected —
+          ensure all are mapped to target networks in KubeVirt VM spec
+      vars:
+        non_lo_ifaces: "{{ ansible_facts['interfaces'] | reject('equalto', 'lo') | list }}"
+      when: (ansible_facts['interfaces'] | reject('equalto', 'lo') | list) | length > 1
       changed_when: false
 
     # ============ MEDIUM: Static IP configuration ============
@@ -1149,6 +1212,8 @@
               {'label': 'Running databases', 'msg': 'Database services are running without a quiesce plan'} if db_check is defined and 'failed' in db_check and db_check.failed else None,
               {'label': 'qemu-guest-agent (RHEL repo)', 'msg': 'qemu-guest-agent not available in configured repositories'} if qga_repo_rhel is defined and 'failed' in qga_repo_rhel and qga_repo_rhel.failed else None,
               {'label': 'qemu-guest-agent (Debian repo)', 'msg': 'qemu-guest-agent not available in configured repositories'} if qga_repo_debian is defined and 'failed' in qga_repo_debian and qga_repo_debian.failed else None,
+              {'label': 'EDR/AV package', 'msg': 'EDR/AV package detected — may block virt-v2v conversion and qemu-guest-agent install post-migration. Add qemu-guest-agent to EDR allow-list before migrating: ' + (edr_pkgs_found | join(', '))} if edr_pkg_check is defined and 'failed' in edr_pkg_check and edr_pkg_check.failed else None,
+              {'label': 'EDR/AV service', 'msg': 'EDR/AV service running — may block virt-v2v conversion and qemu-guest-agent install post-migration. Add qemu-guest-agent to EDR allow-list before migrating: ' + (edr_svcs_running | join(', '))} if edr_svc_check is defined and 'failed' in edr_svc_check and edr_svc_check.failed else None,
               {'label': 'Huge pages', 'msg': 'Huge pages are configured — NUMA topology may differ on KVM host'} if hugepages_check is defined and 'failed' in hugepages_check and hugepages_check.failed else None,
               {'label': 'AppArmor /dev/sd* refs', 'msg': 'AppArmor profiles reference /dev/sd* — may deny /dev/vd* access post-migration'} if apparmor_check is defined and 'failed' in apparmor_check and apparmor_check.failed else None,
               {'label': 'auditd /dev/sd* rules', 'msg': 'auditd rules reference /dev/sd* — will fail silently after device rename'} if auditd_check is defined and 'failed' in auditd_check and auditd_check.failed else None,

@@ -1,7 +1,7 @@
 # Migration Pre/Post Checks — Playbook Reference
 
-Standalone Ansible playbooks for Linux VM migration from **VMware vSphere** to **KVM / OpenShift Virtualization**.
-Both playbooks follow the same pattern: all checks run with `ignore_errors: true`, failures are collected, and a single aggregated report is printed at the end before the play hard-fails.
+Standalone Ansible playbooks for **Linux and Windows** VM migration from **VMware vSphere** to **KVM / OpenShift Virtualization**.
+All playbooks follow the same pattern: every check runs with `ignore_errors: true`, failures are collected into a single list, and a consolidated report is printed at the end before the play hard-fails.
 
 ---
 
@@ -11,7 +11,15 @@ Both playbooks follow the same pattern: all checks run with `ignore_errors: true
 |---|---|
 | ansible-core | 2.14 |
 | Python (control node) | 3.9 |
-| SSH access | Target VM must be reachable over SSH before running |
+| SSH access | Linux target VM must be reachable over SSH |
+| WinRM access | Windows target VM must have WinRM enabled (HTTP port 5985 or HTTPS port 5986) |
+| `ansible.windows` collection | ≥ 2.0.0 — required for Windows playbooks only |
+
+Install Galaxy collections after cloning:
+
+```bash
+ansible-galaxy collection install -r requirements.yml
+```
 
 **RHEL 9 and 10** (AppStream — no extra repositories needed):
 
@@ -42,9 +50,13 @@ sudo apt install ansible
 pipx install ansible-core
 ```
 
-Both playbooks assert these requirements at runtime via `ansible.builtin.assert` before any checks execute.
+All playbooks assert these requirements at runtime via `ansible.builtin.assert` before any checks execute.
 
-**Supported guest OS families:** `RedHat` (RHEL, CentOS, Fedora) and `Debian` (Ubuntu, Debian). Other OS families will fail the preflight assert.
+**Supported guest OS families:**
+- Linux playbooks: `RedHat` (RHEL, CentOS, Fedora) and `Debian` (Ubuntu, Debian).
+- Windows playbooks: `Windows` (Windows Server 2008 R2 / Windows 7 and later).
+
+Other OS families will fail the preflight assert.
 
 ---
 
@@ -95,11 +107,45 @@ ansible-playbook -i inventory post-migration-linux.yml
 ansible-playbook -i inventory post-migration-linux.yml --limit myvm.example.com
 ```
 
+### Pre-migration — Windows (VM still on VMware vSphere)
+
+```bash
+# Full run against a Windows host group
+ansible-playbook -i inventory pre-migration-windows.yml
+
+# Limit to a single host
+ansible-playbook -i inventory pre-migration-windows.yml --limit winvm.example.com
+```
+
+WinRM inventory example (`inventory.yml`):
+
+```yaml
+all:
+  hosts:
+    winvm.example.com:
+      ansible_connection: winrm
+      ansible_winrm_transport: ntlm       # or kerberos / credssp
+      ansible_winrm_server_cert_validation: ignore
+      ansible_user: Administrator
+      ansible_password: "{{ vault_win_password }}"
+```
+
+### Post-migration — Windows (VM booted on KVM / OpenShift Virtualization)
+
+```bash
+# Full run
+ansible-playbook -i inventory post-migration-windows.yml
+
+# Limit to a single host
+ansible-playbook -i inventory post-migration-windows.yml --limit winvm.example.com
+```
+
 ### Lint
 
 ```bash
 python3 -m pip install --user ansible-lint
-ansible-lint pre-migration-linux.yml post-migration-linux.yml
+ansible-lint pre-migration-linux.yml post-migration-linux.yml \
+             pre-migration-windows.yml post-migration-windows.yml
 ```
 
 ---
@@ -318,3 +364,132 @@ Run **after** virt-v2v conversion once the VM has booted on KVM / OpenShift Virt
 | INFO IP addresses | Logs all IPv4 addresses assigned to the VM |
 | INFO dmesg KVM/virtio messages | Logs any KVM/virtio-related dmesg lines (only when errors are found) |
 | INFO Kernel version | Logs the running kernel version |
+
+---
+
+## `pre-migration-windows.yml`
+
+Run **before** virt-v2v conversion while the Windows VM is still on VMware vSphere.
+Requires WinRM access and the `ansible.windows` collection.
+
+### Fact Gathering
+
+| Task | Description |
+|------|-------------|
+| Gather Facts | Collects OS and hardware facts via `ansible.builtin.setup` |
+| Gather Services | Collects Windows service states via `ansible.builtin.service_facts` |
+| INFO OS | Logs Windows edition and version number |
+
+### CRITICAL — Conversion Blockers
+
+| Check | Description |
+|-------|-------------|
+| Check BitLocker is not enabled | Fails if any volume is not `FullyDecrypted` — virt-v2v cannot read encrypted NTFS |
+| Check no Dynamic disks are present | Fails if any disk has `Dynamic` partition style — virt-v2v supports Basic layout only |
+| Check no ReFS volumes are present | Fails if any volume uses the ReFS filesystem — no virt-v2v conversion support |
+| Check Windows version is compatible | Fails if Windows version is below 6.1 (Windows 7 / Server 2008 R2) |
+| Check Secure Boot state | Fails if Secure Boot is enabled — virtio drivers must be signed to pass Secure Boot validation |
+| Check no pending reboot | Fails if reboot registry keys are set — converting a system with a pending reboot produces an inconsistent disk |
+| Check BCD store integrity | Fails if `bcdedit /enum all` returns non-zero — a corrupt BCD causes immediate boot failure after conversion |
+
+### HIGH — Post-Migration Failures
+
+| Check | Description |
+|-------|-------------|
+| Check VMware Tools is installed | Fails if `VMTools` service does not exist — virt-v2v needs it present for clean driver removal |
+| Check VMware Tools service is running | Fails if `VMTools` service is not in running state |
+| Check for NSX or vShield agent services | Fails if `vsepflt`, `vnetflt`, NSX, or vShield services are found — hypervisor-coupled, will break networking on KVM |
+| Check for VMware Horizon or View agent | Fails if Horizon or ViewAgent package is installed — non-functional on KVM |
+| Check for running database services | Fails if MSSQL, Exchange, MySQL, Oracle, or MongoDB is running without a quiesce plan — risk of data corruption |
+| Check C drive has sufficient free space | Fails if C: has less than 2 GB free — virt-v2v needs workspace on the system volume |
+| Check VSS writers are healthy | Fails if any VSS writer is in a failed or error state — snapshot consistency cannot be guaranteed |
+
+### MEDIUM — Operational Concerns
+
+| Check | Description |
+|-------|-------------|
+| Check Hyper-V role is not installed | Fails if the Hyper-V Windows Feature is installed — conflicts with KVM unless nested virtualization is enabled |
+| Check partition table type | Fails if any disk uses MBR — limited to 2 TB and may cause issues with large disks |
+| Check for static IP configuration | Informational — NIC MAC address changes post-migration; static IPs must be re-mapped in the KubeVirt VM spec |
+| Check pending Windows updates | Informational — large update queues increase post-migration reboot loop risk |
+| INFO Domain membership | Logs whether the VM is domain-joined or in a workgroup |
+| INFO Page file configuration | Logs page file location — non-C: page files may become inaccessible if drive order shifts |
+
+### LOW — Operational Readiness
+
+| Check | Description |
+|-------|-------------|
+| Check RDP is enabled | Fails if RDP is disabled — remote access will not be available after migration |
+| INFO VMware registry keys | Logs presence of `HKLM:\SOFTWARE\VMware, Inc.` for post-migration cleanup reference |
+| INFO Disk inventory | Logs each disk's size, partition style, and operational status |
+| INFO NIC inventory | Logs each network adapter's name, description, and link state |
+
+---
+
+## `post-migration-windows.yml`
+
+Run **after** virt-v2v conversion once the Windows VM has booted on KVM / OpenShift Virtualization.
+Requires WinRM access and the `ansible.windows` collection.
+
+### Fact Gathering
+
+| Task | Description |
+|------|-------------|
+| Gather Facts | Collects OS and hardware facts via `ansible.builtin.setup` |
+| Gather Services | Collects Windows service states via `ansible.builtin.service_facts` |
+| INFO OS | Logs Windows edition, version, and kernel build |
+
+### CRITICAL — Must Pass Before VM Is Considered Migrated
+
+| Check | Description |
+|-------|-------------|
+| Check platform is KVM (not VMware) | Fails if `Win32_ComputerSystem.Manufacturer` still contains `VMware` — VM is not running on KVM |
+| Check VMware PVSCSI and VMXNET drivers are not active | Fails if VMware storage or network drivers are still bound — incomplete or failed conversion |
+| Check virtio-net (NetKVM) driver is active | Fails if no Red Hat VirtIO network adapter is detected — VM has no functional virtio NIC |
+| Check virtio storage driver is active | Fails if VirtIO SCSI or Block storage driver is not found — VM cannot access its disk via virtio |
+| Check VMware Tools package is removed | Fails if VMware Tools package is still installed |
+| Check VMware Tools service is not running | Fails if `VMTools` service is still running |
+| Check C drive is accessible | Fails if `C:\` path is not reachable — system volume may be unmounted or corrupt |
+
+### HIGH — Post-Migration Operational Readiness
+
+| Check | Description |
+|-------|-------------|
+| Check QEMU Guest Agent service is running | Fails if `QEMU-GA` service is absent or not running — required for OCP-V IP reporting, snapshot quiesce, and live migration |
+| Check no VMware services are running | Fails if any service matching `^VM`, `VMware`, or `vmtools` is in running state |
+| Check VMware Tools binary is absent | Fails if `C:\Program Files\VMware\VMware Tools` directory still exists |
+| Check VMware registry keys are absent | Fails if `HKLM:\SOFTWARE\VMware, Inc.` registry key still exists |
+| Check Windows activation status | Fails if `slmgr.vbs /dli` does not return `License Status: Licensed` — KMS VMs need re-activation after UUID change |
+| Check default route exists | Fails if no `0.0.0.0/0` route is found — network is misconfigured |
+| Check DNS resolution works | Fails if hostname does not resolve — DNS may be broken |
+| Check no excess critical errors in Event Log since boot | Fails if more than 5 System Event Log errors have occurred since last boot |
+
+### MEDIUM — Operational Quality
+
+| Check | Description |
+|-------|-------------|
+| Check hostname matches inventory | Fails if `ansible_hostname` does not match the inventory short name |
+| Check C drive free space post-migration | Fails if C: has less than 1 GB free after conversion |
+| Check Windows Time service is running | Fails if `W32Time` is not running — clock drift breaks Kerberos and TLS certificate validation |
+| Check BCD store has no VMware-specific entries | Fails if `bcdedit /enum all` output contains `vmware` — boot configuration contamination |
+
+### LOW — Platform Integration
+
+| Check | Description |
+|-------|-------------|
+| Check virtio-serial device exists for QEMU Guest Agent | Fails if no VirtIO Serial device is found — QEMU Guest Agent communication channel may not function |
+| Check RDP is still enabled post-migration | Fails if RDP has been disabled — remote access is unavailable |
+
+### Informational Only
+
+| Task | Description |
+|------|-------------|
+| INFO Detected platform | Logs `Win32_ComputerSystem.Manufacturer` |
+| INFO NIC driver details | Logs each adapter name, description, and link state |
+| INFO Disk details | Logs each disk number, size, and partition style |
+| INFO C drive usage | Logs used and free space on the C: volume |
+| INFO Event log errors since boot | Logs the count of System errors since last boot |
+| INFO Default route | Logs the active default gateway |
+| INFO IP addresses | Logs all IPv4 addresses assigned to the VM |
+| INFO DNS resolution result | Logs the IP returned for the hostname lookup |
+| INFO Windows version | Logs Windows edition, version number, and kernel build |

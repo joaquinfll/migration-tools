@@ -123,6 +123,21 @@
       ansible.builtin.debug:
         msg: "{{ nic_driver_post_check.stdout_lines }}"
 
+    - name: INFO Network interface count
+      ansible.builtin.debug:
+        msg: "NICs (excluding loopback): {{ non_lo_ifaces | length }} — {{ non_lo_ifaces | join(', ') }}"
+      vars:
+        non_lo_ifaces: "{{ ansible_facts['interfaces'] | reject('equalto', 'lo') | list }}"
+
+    - name: INFO NIC details
+      ansible.builtin.debug:
+        msg: >-
+          {{ item }}: mac={{ ansible_facts[item]['macaddress'] | default('n/a') }}
+          ip={{ ansible_facts[item].get('ipv4', {}).get('address', 'no-ip') }}
+          driver={{ ansible_facts[item]['module'] | default('unknown') }}
+          mtu={{ ansible_facts[item]['mtu'] | default('n/a') }}
+      loop: "{{ ansible_facts['interfaces'] | reject('equalto', 'lo') | list }}"
+
     # ============ CRITICAL: open-vm-tools must be removed ============
     # The VMware guest agent package must not be present on a KVM guest.
 
@@ -180,6 +195,33 @@
         ansible_facts.services['qemu-guest-agent.service'].state != 'running'
       ignore_errors: true
       register: qga_svc_check
+
+    - name: Detect running EDR or AV services
+      ansible.builtin.set_fact:
+        edr_blocking: >-
+          {{
+            ansible_facts.services
+            | dict2items
+            | selectattr('key', 'match',
+                '^(falcon-sensor|cbsensor|sentinelone|ds_agent|cylancesvc|sophosavp|trellix)')
+            | selectattr('value.state', 'equalto', 'running')
+            | map(attribute='key')
+            | list
+          }}
+
+    - name: Check for EDR interference with qemu-guest-agent
+      ansible.builtin.debug:
+        msg: >-
+          EDR/AV service is likely blocking qemu-guest-agent: {{ edr_blocking | join(', ') }}.
+          Add qemu-guest-agent to the EDR allow-list or disable tamper protection,
+          then reinstall the package and restart the service.
+      failed_when: edr_blocking | length > 0
+      changed_when: false
+      ignore_errors: true
+      register: edr_blocking_check
+      when: >
+        (qga_pkg_check is defined and qga_pkg_check.failed) or
+        (qga_svc_check is defined and qga_svc_check.failed)
 
     # ============ HIGH: VMware Tools files must be absent ============
     # Leftover VMware binary/config artifacts can cause confusion or conflicts.
@@ -450,6 +492,7 @@
               {'label': 'fstab stale /dev/sd*', 'msg': 'fstab still references /dev/sd* device paths'} if fstab_post_check is defined and 'failed' in fstab_post_check and fstab_post_check.failed else None,
               {'label': 'qemu-guest-agent package', 'msg': 'qemu-guest-agent is not installed'} if qga_pkg_check is defined and 'failed' in qga_pkg_check and qga_pkg_check.failed else None,
               {'label': 'qemu-guest-agent service', 'msg': 'qemu-guest-agent service is not running'} if qga_svc_check is defined and 'failed' in qga_svc_check and qga_svc_check.failed else None,
+              {'label': 'EDR blocking qemu-guest-agent', 'msg': 'EDR/AV service is likely blocking qemu-guest-agent — add it to the allow-list and reinstall: ' + (edr_blocking | join(', '))} if edr_blocking_check is defined and 'failed' in edr_blocking_check and edr_blocking_check.failed else None,
               {'label': 'VMware Tools binary', 'msg': '/usr/bin/vmware-toolsd still exists'} if vmware_toolsd_check is defined and vmware_toolsd_check.stat.exists else None,
               {'label': 'VMware Tools config dir', 'msg': '/etc/vmware-tools still exists'} if vmware_confdir_check is defined and vmware_confdir_check.stat.exists else None,
               {'label': 'VMware lib dir', 'msg': '/usr/lib/vmware-tools still exists'} if vmware_libdir_check is defined and vmware_libdir_check.stat.exists else None,
