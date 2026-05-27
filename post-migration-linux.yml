@@ -1,0 +1,490 @@
+---
+# Linux Post-Migration Validation Playbook
+# Run after virt-v2v conversion to confirm the VM is clean and healthy on KVM/OpenShift Virtualization
+- name: Post-migration validation for Linux VM on KVM/OpenShift Virtualization
+  hosts: all
+  gather_facts: false
+  ignore_unreachable: true
+
+  tasks:
+    - name: Gather Facts
+      ansible.builtin.setup:
+
+    - name: Gather Packages
+      ansible.builtin.package_facts:
+        manager: auto
+
+    - name: Gather Services
+      ansible.builtin.service_facts:
+
+    - name: INFO OS
+      ansible.builtin.debug:
+        msg: "{{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }} — kernel {{ ansible_facts['kernel'] }}"
+
+    - name: Assert preflight requirements
+      ansible.builtin.assert:
+        that:
+          - ansible_version.full is version('2.14', '>=')
+          - ansible_facts['os_family'] in ['RedHat', 'Debian']
+        fail_msg: >-
+          Preflight assertion failed.
+          Ansible >= 2.14 required (found {{ ansible_version.full }}).
+          Supported OS families: RedHat, Debian (found {{ ansible_facts['os_family'] }}).
+        success_msg: >-
+          Preflight OK — Ansible {{ ansible_version.full }},
+          {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}
+
+    # ============ CRITICAL: Platform must be KVM, not VMware ============
+    # The single most important check — confirms the VM is no longer running on VMware.
+
+    - name: Check platform is KVM (not VMware)
+      ansible.builtin.debug:
+        msg: "Running in {{ ansible_facts['product_name'] }}"
+      failed_when: "'VMware' in ansible_facts['product_name']"
+      ignore_errors: true
+      register: platform_check
+
+    - name: INFO Hypervisor
+      ansible.builtin.shell: |
+        systemd-detect-virt 2>/dev/null || true
+      changed_when: false
+      ignore_errors: true
+      register: virt_type
+
+    - name: INFO Detected virtualization type
+      ansible.builtin.debug:
+        msg: "Detected: {{ virt_type.stdout }}"
+
+    # ============ CRITICAL: VMware kernel modules must be unloaded ============
+    # Any VMware kernel module still loaded indicates incomplete cleanup or a failed conversion.
+
+    - name: Check VMware kernel modules are not loaded
+      ansible.builtin.shell: |
+        lsmod 2>/dev/null | grep -E '^(vmxnet3?|pvscsi|vmhgfs|vmmemctl|vmci|vmw_vsock_vmci_transport|vmw_balloon)' || true
+      changed_when: false
+      ignore_errors: true
+      register: vmware_modules_check
+      failed_when: vmware_modules_check.stdout | length > 0
+
+    # ============ CRITICAL: virtio drivers must be loaded ============
+    # The VM must be using virtio block and network drivers to run properly on KVM.
+
+    - name: Check virtio_blk or virtio_scsi driver is loaded
+      ansible.builtin.shell: |
+        lsmod 2>/dev/null | grep -E '^virtio_(blk|scsi)' || true
+      changed_when: false
+      ignore_errors: true
+      register: virtio_blk_check
+      failed_when: virtio_blk_check.stdout | length == 0
+
+    - name: Check virtio_net driver is loaded
+      ansible.builtin.shell: |
+        lsmod 2>/dev/null | grep -E '^virtio_net' || true
+      changed_when: false
+      ignore_errors: true
+      register: virtio_net_check
+      failed_when: virtio_net_check.stdout | length == 0
+
+    # ============ CRITICAL: Root disk must be a virtio disk ============
+    # After conversion the primary disk should be /dev/vda (virtio-blk) or presented via virtio-scsi.
+
+    - name: Check root disk is virtio (vda/vdb or virtio-scsi)
+      ansible.builtin.shell: |
+        lsblk -d -o NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}' | grep -vE '^sr' || true
+      changed_when: false
+      ignore_errors: true
+      register: root_disk_check
+      failed_when: >
+        root_disk_check.stdout_lines | length > 0 and
+        root_disk_check.stdout_lines | select('match', '^vd') | list | length == 0 and
+        root_disk_check.stdout_lines | select('match', '^sd') | list | length > 0
+
+    - name: INFO Disk devices detected
+      ansible.builtin.debug:
+        msg: "{{ root_disk_check.stdout_lines }}"
+
+    # ============ CRITICAL: Network interface must use virtio_net ============
+    # All non-loopback interfaces should be driven by virtio_net post-migration.
+
+    - name: Check primary NIC uses virtio_net driver
+      ansible.builtin.shell: |
+        for iface in $(ip -o link show | awk -F': ' '$2!="lo"{print $2}' | cut -d'@' -f1); do
+          driver=$(ethtool -i "$iface" 2>/dev/null | awk '/^driver:/{print $2}')
+          echo "$iface: $driver"
+        done
+      changed_when: false
+      ignore_errors: true
+      register: nic_driver_post_check
+      failed_when: >
+        nic_driver_post_check.stdout_lines | length > 0 and
+        nic_driver_post_check.stdout_lines | reject('search', 'virtio_net') | list | length > 0
+
+    - name: INFO NIC drivers detected
+      ansible.builtin.debug:
+        msg: "{{ nic_driver_post_check.stdout_lines }}"
+
+    # ============ CRITICAL: open-vm-tools must be removed ============
+    # The VMware guest agent package must not be present on a KVM guest.
+
+    - name: Check open-vm-tools package is removed
+      ansible.builtin.debug:
+        msg: "open-vm-tools is still installed"
+      failed_when: "'open-vm-tools' in ansible_facts['packages']"
+      ignore_errors: true
+      register: ovmt_pkg_check
+
+    # ============ CRITICAL: vmtoolsd service must not be running ============
+
+    - name: Check vmtoolsd service is not running
+      ansible.builtin.debug:
+        msg: "VMware tools daemon is still running"
+      failed_when: >
+        ('open-vm-tools.service' in ansible_facts.services and
+          ansible_facts.services['open-vm-tools.service'].state == 'running')
+        or
+        ('vmtoolsd.service' in ansible_facts.services and
+          ansible_facts.services['vmtoolsd.service'].state == 'running')
+      ignore_errors: true
+      register: vmtoolsd_svc_check
+
+    # ============ CRITICAL: fstab must not reference /dev/sd* ============
+    # After conversion disks are /dev/vd*; stale /dev/sd* entries in fstab will prevent boot.
+
+    - name: Check fstab has no stale /dev/sd* references
+      ansible.builtin.shell: |
+        grep -E '^\s*/dev/(sd|xvd)' /etc/fstab 2>/dev/null | grep -vE '^\s*#' || true
+      changed_when: false
+      ignore_errors: true
+      register: fstab_post_check
+      failed_when: fstab_post_check.stdout | length > 0
+      when: "'/etc/fstab' is file"
+
+    # ============ HIGH: qemu-guest-agent must be installed ============
+    # OpenShift Virtualization uses qemu-guest-agent for lifecycle management,
+    # IP address reporting, snapshot freeze/thaw, and live migration coordination.
+
+    - name: Check qemu-guest-agent is installed
+      ansible.builtin.debug:
+        msg: "qemu-guest-agent is not installed"
+      failed_when: >
+        'qemu-guest-agent' not in ansible_facts['packages'] and
+        'qemu-ga' not in ansible_facts['packages']
+      ignore_errors: true
+      register: qga_pkg_check
+
+    - name: Check qemu-guest-agent service is running
+      ansible.builtin.debug:
+        msg: "qemu-guest-agent service is not running"
+      failed_when: >
+        'qemu-guest-agent.service' not in ansible_facts.services or
+        ansible_facts.services['qemu-guest-agent.service'].state != 'running'
+      ignore_errors: true
+      register: qga_svc_check
+
+    # ============ HIGH: VMware Tools files must be absent ============
+    # Leftover VMware binary/config artifacts can cause confusion or conflicts.
+
+    - name: Check VMware Tools binary is absent
+      ansible.builtin.stat:
+        path: /usr/bin/vmware-toolsd
+      register: vmware_toolsd_check
+      changed_when: false
+
+    - name: Check VMware Tools config directory is absent
+      ansible.builtin.stat:
+        path: /etc/vmware-tools
+      register: vmware_confdir_check
+      changed_when: false
+
+    - name: Check VMware ProgramData directory is absent (Windows-style remnant)
+      ansible.builtin.stat:
+        path: /usr/lib/vmware-tools
+      register: vmware_libdir_check
+      changed_when: false
+
+    # ============ HIGH: No VMware packages remaining ============
+
+    - name: Check for remaining VMware packages (RHEL)
+      ansible.builtin.debug:
+        msg: "VMware packages still installed: {{ vmware_pkgs_found_rhel | join(', ') }}"
+      vars:
+        vmware_pkgs_found_rhel: >-
+          {{ ansible_facts['packages'].keys() | select('match', '(?i)(vmware|open-vm-tools)') | list }}
+      failed_when: vmware_pkgs_found_rhel | length > 0
+      changed_when: false
+      ignore_errors: true
+      register: vmware_pkgs_rhel
+      when: ansible_facts['os_family'] == "RedHat"
+
+    - name: Check for remaining VMware packages (Debian)
+      ansible.builtin.debug:
+        msg: "VMware packages still installed: {{ vmware_pkgs_found_debian | join(', ') }}"
+      vars:
+        vmware_pkgs_found_debian: >-
+          {{ ansible_facts['packages'].keys() | select('match', '(?i)(vmware|open-vm-tools)') | list }}
+      failed_when: vmware_pkgs_found_debian | length > 0
+      changed_when: false
+      ignore_errors: true
+      register: vmware_pkgs_debian
+      when: ansible_facts['os_family'] == "Debian"
+
+    # ============ HIGH: VMware udev rules must be removed ============
+
+    - name: Check for leftover VMware udev rules
+      ansible.builtin.shell: |
+        grep -rlE '(vmware|vmxnet|pvscsi)' /etc/udev/rules.d/ 2>/dev/null || true
+      changed_when: false
+      ignore_errors: true
+      register: vmware_udev_check
+      failed_when: vmware_udev_check.stdout | length > 0
+      when: "'/etc/udev/rules.d' is directory"
+
+    - name: Check persistent net rules are absent
+      ansible.builtin.stat:
+        path: /etc/udev/rules.d/70-persistent-net.rules
+      register: persistent_net_post_check
+      changed_when: false
+
+    # ============ HIGH: FQDN resolves correctly ============
+    # Confirms DNS is functional and the VM's hostname is resolvable after network reconfiguration.
+
+    - name: Check FQDN resolves
+      ansible.builtin.shell: |
+        getent hosts $(hostname -f) 2>/dev/null || true
+      changed_when: false
+      ignore_errors: true
+      register: fqdn_resolve_check
+      failed_when: fqdn_resolve_check.stdout | length == 0
+
+    - name: INFO FQDN resolution result
+      ansible.builtin.debug:
+        msg: "{{ fqdn_resolve_check.stdout }}"
+
+    # ============ HIGH: NTP/chrony must be running ============
+    # Clock sync is critical post-migration; a drifted clock breaks TLS and Kerberos auth.
+
+    - name: Check NTP/chrony service is running
+      ansible.builtin.debug:
+        msg: "No NTP service is running"
+      failed_when: >
+        ('chronyd.service' not in ansible_facts.services or ansible_facts.services['chronyd.service'].state != 'running') and
+        ('chrony.service' not in ansible_facts.services or ansible_facts.services['chrony.service'].state != 'running') and
+        ('ntpd.service' not in ansible_facts.services or ansible_facts.services['ntpd.service'].state != 'running') and
+        ('ntp.service' not in ansible_facts.services or ansible_facts.services['ntp.service'].state != 'running')
+      ignore_errors: true
+      register: ntp_post_check
+
+    # ============ HIGH: cloud-init completed successfully ============
+    # cloud-init handles first-boot network config, hostname, and SSH keys on KubeVirt;
+    # a failed cloud-init run means the VM may be misconfigured.
+
+    - name: Check cloud-init status
+      ansible.builtin.shell: |
+        cloud-init status 2>/dev/null || true
+      changed_when: false
+      ignore_errors: true
+      register: cloudinit_status_check
+      failed_when: >
+        cloudinit_status_check.stdout | length > 0 and
+        'done' not in cloudinit_status_check.stdout
+      when: "'cloud-init' in ansible_facts['packages']"
+
+    # ============ HIGH: SELinux autorelabel completed ============
+    # After migration, SELinux relabeling should have consumed /.autorelabel.
+    # If it still exists, SELinux relabeling did not run on first boot.
+
+    - name: Check SELinux autorelabel file is consumed
+      ansible.builtin.stat:
+        path: /.autorelabel
+      register: autorelabel_check
+      changed_when: false
+
+    - name: Check SELinux is in expected enforcing/permissive mode
+      ansible.builtin.shell: |
+        getenforce 2>/dev/null || echo "Disabled"
+      changed_when: false
+      ignore_errors: true
+      register: selinux_post_check
+
+    - name: INFO SELinux mode post-migration
+      ansible.builtin.debug:
+        msg: "SELinux: {{ selinux_post_check.stdout }}"
+
+    # ============ MEDIUM: Hostname matches expected value ============
+
+    - name: Check hostname matches inventory
+      ansible.builtin.debug:
+        msg: "Hostname mismatch: ansible_hostname={{ ansible_hostname }} inventory={{ inventory_hostname | split('.') | first }}"
+      failed_when: ansible_hostname != (inventory_hostname | split('.') | first)
+      ignore_errors: true
+      register: hostname_check
+
+    # ============ MEDIUM: SSH host keys are present ============
+    # virt-v2v should preserve SSH host keys; if absent, clients will get host key warnings.
+
+    - name: Check SSH host keys exist
+      ansible.builtin.shell: |
+        ls /etc/ssh/ssh_host_*_key 2>/dev/null || true
+      changed_when: false
+      ignore_errors: true
+      register: ssh_hostkey_check
+      failed_when: ssh_hostkey_check.stdout | length == 0
+
+    # ============ MEDIUM: Root filesystem has sufficient free space ============
+
+    - name: Check root filesystem free space post-migration
+      ansible.builtin.shell: |
+        df -BG / | awk 'NR==2{gsub("G",""); print $4}'
+      changed_when: false
+      ignore_errors: true
+      register: root_space_post_check
+      failed_when: root_space_post_check.stdout | int < 1
+
+    - name: INFO Root filesystem usage
+      ansible.builtin.shell: |
+        df -h /
+      changed_when: false
+      ignore_errors: true
+      register: df_info
+
+    - name: INFO Filesystem usage detail
+      ansible.builtin.debug:
+        msg: "{{ df_info.stdout_lines }}"
+
+    # ============ MEDIUM: No VMware entries in GRUB config ============
+    # virt-v2v should have updated GRUB; leftover VMware kernel args are a warning sign.
+
+    - name: Check GRUB config has no VMware-specific kernel args
+      ansible.builtin.shell: |
+        grep -rE '(vmware|open-vm-tools|vmxnet)' /boot/grub/grub.cfg /boot/grub2/grub.cfg 2>/dev/null || true
+      changed_when: false
+      ignore_errors: true
+      register: grub_vmware_check
+      failed_when: grub_vmware_check.stdout | length > 0
+
+    # ============ MEDIUM: virtio_balloon driver loaded (replaces vmmemctl) ============
+
+    - name: Check virtio_balloon driver is loaded
+      ansible.builtin.shell: |
+        lsmod 2>/dev/null | grep -E '^virtio_balloon' || true
+      changed_when: false
+      ignore_errors: true
+      register: virtio_balloon_check
+      failed_when: virtio_balloon_check.stdout | length == 0
+
+    # ============ MEDIUM: Network connectivity ============
+
+    - name: Check default route exists
+      ansible.builtin.shell: |
+        ip route show default 2>/dev/null || true
+      changed_when: false
+      ignore_errors: true
+      register: default_route_check
+      failed_when: default_route_check.stdout | length == 0
+
+    - name: INFO Default route
+      ansible.builtin.debug:
+        msg: "{{ default_route_check.stdout }}"
+
+    - name: INFO IP addresses
+      ansible.builtin.debug:
+        msg: "{{ ansible_facts['all_ipv4_addresses'] }}"
+
+    # ============ LOW: virtio-serial / qemu-guest-agent channel ============
+    # The virtio-serial device must be present for qemu-guest-agent to communicate.
+
+    - name: Check virtio-serial device exists for qemu-guest-agent
+      ansible.builtin.shell: |
+        ls /dev/virtio-ports/ 2>/dev/null || true
+      changed_when: false
+      ignore_errors: true
+      register: virtio_serial_check
+      failed_when: virtio_serial_check.stdout | length == 0
+
+    # ============ LOW: No leftover VMware vmdk or snapshot files on disk ============
+
+    - name: Check for leftover VMware snapshot/delta files
+      ansible.builtin.shell: |
+        find / -maxdepth 6 -name '*.vmdk' -o -name '*-delta.vmdk' 2>/dev/null | grep -vE '^/(proc|sys|dev)' || true
+      changed_when: false
+      ignore_errors: true
+      register: vmdk_remnant_check
+      failed_when: vmdk_remnant_check.stdout | length > 0
+
+    # ============ LOW: dmesg KVM/virtio errors ============
+
+    - name: Check dmesg for KVM or virtio errors
+      ansible.builtin.shell: |
+        dmesg 2>/dev/null | grep -iE '(kvm|virtio).*(error|fail|panic|oops)' || true
+      changed_when: false
+      ignore_errors: true
+      register: dmesg_check
+      failed_when: dmesg_check.stdout | length > 0
+
+    - name: INFO dmesg KVM/virtio messages
+      ansible.builtin.debug:
+        msg: "{{ dmesg_check.stdout_lines }}"
+      when: dmesg_check.stdout | length > 0
+
+    # ============ LOW: Kernel version info ============
+
+    - name: INFO Kernel version
+      ansible.builtin.debug:
+        msg: "Kernel: {{ ansible_facts['kernel'] }}"
+
+    # ============ AGGREGATION: Report all failures at the end ============
+
+    - name: Build failed check list
+      ansible.builtin.set_fact:
+        failed_check_list: >-
+          {{
+            [
+              {'label': 'Platform (still VMware)', 'msg': 'VM product_name still contains VMware — not running on KVM'} if platform_check is defined and 'failed' in platform_check and platform_check.failed else None,
+              {'label': 'VMware kernel modules', 'msg': 'VMware kernel modules still loaded: ' + vmware_modules_check.stdout} if vmware_modules_check is defined and 'failed' in vmware_modules_check and vmware_modules_check.failed else None,
+              {'label': 'virtio_blk/scsi', 'msg': 'virtio_blk or virtio_scsi driver is not loaded'} if virtio_blk_check is defined and 'failed' in virtio_blk_check and virtio_blk_check.failed else None,
+              {'label': 'virtio_net', 'msg': 'virtio_net driver is not loaded'} if virtio_net_check is defined and 'failed' in virtio_net_check and virtio_net_check.failed else None,
+              {'label': 'Root disk (virtio)', 'msg': 'Root disk is still /dev/sd* — not using virtio block device'} if root_disk_check is defined and 'failed' in root_disk_check and root_disk_check.failed else None,
+              {'label': 'NIC driver (virtio_net)', 'msg': 'One or more NICs are not using virtio_net driver: ' + nic_driver_post_check.stdout} if nic_driver_post_check is defined and 'failed' in nic_driver_post_check and nic_driver_post_check.failed else None,
+              {'label': 'open-vm-tools package', 'msg': 'open-vm-tools is still installed'} if ovmt_pkg_check is defined and 'failed' in ovmt_pkg_check and ovmt_pkg_check.failed else None,
+              {'label': 'vmtoolsd service', 'msg': 'VMware tools daemon is still running'} if vmtoolsd_svc_check is defined and 'failed' in vmtoolsd_svc_check and vmtoolsd_svc_check.failed else None,
+              {'label': 'fstab stale /dev/sd*', 'msg': 'fstab still references /dev/sd* device paths'} if fstab_post_check is defined and 'failed' in fstab_post_check and fstab_post_check.failed else None,
+              {'label': 'qemu-guest-agent package', 'msg': 'qemu-guest-agent is not installed'} if qga_pkg_check is defined and 'failed' in qga_pkg_check and qga_pkg_check.failed else None,
+              {'label': 'qemu-guest-agent service', 'msg': 'qemu-guest-agent service is not running'} if qga_svc_check is defined and 'failed' in qga_svc_check and qga_svc_check.failed else None,
+              {'label': 'VMware Tools binary', 'msg': '/usr/bin/vmware-toolsd still exists'} if vmware_toolsd_check is defined and vmware_toolsd_check.stat.exists else None,
+              {'label': 'VMware Tools config dir', 'msg': '/etc/vmware-tools still exists'} if vmware_confdir_check is defined and vmware_confdir_check.stat.exists else None,
+              {'label': 'VMware lib dir', 'msg': '/usr/lib/vmware-tools still exists'} if vmware_libdir_check is defined and vmware_libdir_check.stat.exists else None,
+              {'label': 'VMware packages (RHEL)', 'msg': 'VMware packages still installed: ' + (ansible_facts['packages'].keys() | select('match', '(?i)(vmware|open-vm-tools)') | list | join(', '))} if vmware_pkgs_rhel is defined and 'failed' in vmware_pkgs_rhel and vmware_pkgs_rhel.failed else None,
+              {'label': 'VMware packages (Debian)', 'msg': 'VMware packages still installed: ' + (ansible_facts['packages'].keys() | select('match', '(?i)(vmware|open-vm-tools)') | list | join(', '))} if vmware_pkgs_debian is defined and 'failed' in vmware_pkgs_debian and vmware_pkgs_debian.failed else None,
+              {'label': 'VMware udev rules', 'msg': 'VMware udev rules still present'} if vmware_udev_check is defined and 'failed' in vmware_udev_check and vmware_udev_check.failed else None,
+              {'label': 'Persistent net rules', 'msg': '/etc/udev/rules.d/70-persistent-net.rules still present'} if persistent_net_post_check is defined and persistent_net_post_check.stat.exists else None,
+              {'label': 'FQDN resolution', 'msg': 'FQDN does not resolve — DNS may be broken'} if fqdn_resolve_check is defined and 'failed' in fqdn_resolve_check and fqdn_resolve_check.failed else None,
+              {'label': 'NTP service', 'msg': 'No NTP/chrony service is running'} if ntp_post_check is defined and 'failed' in ntp_post_check and ntp_post_check.failed else None,
+              {'label': 'cloud-init status', 'msg': 'cloud-init did not complete successfully: ' + cloudinit_status_check.stdout} if cloudinit_status_check is defined and 'failed' in cloudinit_status_check and cloudinit_status_check.failed else None,
+              {'label': 'SELinux autorelabel', 'msg': '/.autorelabel still exists — SELinux relabeling did not run on first boot'} if autorelabel_check is defined and autorelabel_check.stat.exists else None,
+              {'label': 'Hostname mismatch', 'msg': 'Hostname does not match inventory'} if hostname_check is defined and 'failed' in hostname_check and hostname_check.failed else None,
+              {'label': 'SSH host keys', 'msg': 'No SSH host keys found in /etc/ssh/'} if ssh_hostkey_check is defined and 'failed' in ssh_hostkey_check and ssh_hostkey_check.failed else None,
+              {'label': 'Root disk space', 'msg': 'Root filesystem has less than 1 GB free'} if root_space_post_check is defined and 'failed' in root_space_post_check and root_space_post_check.failed else None,
+              {'label': 'GRUB VMware args', 'msg': 'GRUB config contains VMware-specific kernel arguments'} if grub_vmware_check is defined and 'failed' in grub_vmware_check and grub_vmware_check.failed else None,
+              {'label': 'virtio_balloon', 'msg': 'virtio_balloon driver is not loaded (memory ballooning inactive)'} if virtio_balloon_check is defined and 'failed' in virtio_balloon_check and virtio_balloon_check.failed else None,
+              {'label': 'Default route', 'msg': 'No default route found — network may be misconfigured'} if default_route_check is defined and 'failed' in default_route_check and default_route_check.failed else None,
+              {'label': 'virtio-serial channel', 'msg': '/dev/virtio-ports/ not found — qemu-guest-agent may not communicate'} if virtio_serial_check is defined and 'failed' in virtio_serial_check and virtio_serial_check.failed else None,
+              {'label': 'VMDK remnants', 'msg': 'VMDK files found on disk: ' + vmdk_remnant_check.stdout} if vmdk_remnant_check is defined and 'failed' in vmdk_remnant_check and vmdk_remnant_check.failed else None,
+              {'label': 'dmesg errors', 'msg': 'KVM/virtio errors found in dmesg'} if dmesg_check is defined and 'failed' in dmesg_check and dmesg_check.failed else None
+            ] | reject('equalto', None) | list
+          }}
+
+    - name: Report failed post-migration checks
+      ansible.builtin.debug:
+        msg: "{{ item.label }}: {{ item.msg }}"
+      loop: "{{ failed_check_list }}"
+      loop_control:
+        label: "{{ item.label }}"
+      when: failed_check_list | length > 0
+
+    - name: Fail if any post-migration checks failed
+      ansible.builtin.fail:
+        msg: >-
+          Post-migration validation failed. One or more checks reported issues above.
+          The VM may not be operating correctly on KVM/OpenShift Virtualization.
+          Please review and remediate all failures before putting the VM into production.
+      when: failed_check_list | length > 0

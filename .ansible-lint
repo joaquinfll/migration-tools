@@ -1,0 +1,15 @@
+---
+profile: moderate
+
+exclude_paths:
+  - .git/
+
+warn_list:
+  - experimental
+
+skip_list:
+  # Aggregation Jinja expressions are intentionally long — one entry per check per line
+  - yaml[line-length]
+  # Shell is used deliberately for cross-distro read-only inspection;
+  # all tasks already carry changed_when: false
+  - command-instead-of-module

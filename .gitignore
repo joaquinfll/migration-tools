@@ -1,0 +1,53 @@
+# Ansible local cache (tmp files, facts cache, collections cache)
+.ansible/
+
+# Ansible retry files
+*.retry
+
+# Ansible vault password files
+.vault_pass
+.vault_password
+vault_pass.txt
+vault_password.txt
+*vault*password*
+
+# Inventory files with sensitive host data — commit sanitised examples only
+inventory
+inventory.ini
+inventory.yml
+inventory.yaml
+hosts
+hosts.ini
+!inventory.example
+!hosts.example
+
+# Sensitive variable files
+group_vars/*/vault.yml
+host_vars/*/vault.yml
+**/secrets.yml
+**/*.secret
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+.env
+
+# Ansible Collections installed locally
+collections/
+
+# Logs
+*.log
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

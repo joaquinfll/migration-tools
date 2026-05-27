@@ -1,0 +1,320 @@
+# Migration Pre/Post Checks — Playbook Reference
+
+Standalone Ansible playbooks for Linux VM migration from **VMware vSphere** to **KVM / OpenShift Virtualization**.
+Both playbooks follow the same pattern: all checks run with `ignore_errors: true`, failures are collected, and a single aggregated report is printed at the end before the play hard-fails.
+
+---
+
+## Prerequisites
+
+| Requirement | Minimum version |
+|---|---|
+| ansible-core | 2.14 |
+| Python (control node) | 3.9 |
+| SSH access | Target VM must be reachable over SSH before running |
+
+**RHEL 9 and 10** (AppStream — no extra repositories needed):
+
+```bash
+sudo dnf install ansible-core
+```
+
+**CentOS Stream / AlmaLinux / Rocky Linux** (EPEL required):
+
+```bash
+sudo dnf install epel-release
+sudo dnf install ansible-core
+```
+
+**Ubuntu**:
+
+```bash
+sudo apt update
+sudo apt install software-properties-common
+sudo add-apt-repository --yes --update ppa:ansible/ansible
+sudo apt install ansible
+```
+
+
+**Any OS** (pipx — keeps Ansible isolated from system Python):
+
+```bash
+pipx install ansible-core
+```
+
+Both playbooks assert these requirements at runtime via `ansible.builtin.assert` before any checks execute.
+
+**Supported guest OS families:** `RedHat` (RHEL, CentOS, Fedora) and `Debian` (Ubuntu, Debian). Other OS families will fail the preflight assert.
+
+---
+
+## Variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `immutable_files_list` | No | `['/etc/resolv.conf']` | List of file paths to inspect for the `chattr +i` immutable attribute before migration. Supply additional critical config files as needed. |
+
+Override the default at invocation time:
+
+```bash
+ansible-playbook -i inventory pre-migration-linux.yml \
+  -e '{"immutable_files_list": ["/etc/resolv.conf", "/etc/fstab", "/boot/grub2/grub.cfg"]}'
+```
+
+---
+
+## Usage
+
+### Pre-migration (VM still on VMware vSphere)
+
+```bash
+# Dry-run — simulate without connecting to the VM
+ansible-playbook -i inventory pre-migration-linux.yml --check --diff
+
+# Full run
+ansible-playbook -i inventory pre-migration-linux.yml
+
+# Limit to a single host
+ansible-playbook -i inventory pre-migration-linux.yml --limit myvm.example.com
+
+# With custom immutable file list
+ansible-playbook -i inventory pre-migration-linux.yml \
+  -e '{"immutable_files_list": ["/etc/resolv.conf", "/etc/fstab"]}'
+```
+
+### Post-migration (VM booted on KVM / OpenShift Virtualization)
+
+```bash
+# Dry-run
+ansible-playbook -i inventory post-migration-linux.yml --check --diff
+
+# Full run
+ansible-playbook -i inventory post-migration-linux.yml
+
+# Limit to a single host
+ansible-playbook -i inventory post-migration-linux.yml --limit myvm.example.com
+```
+
+### Lint
+
+```bash
+python3 -m pip install --user ansible-lint
+ansible-lint pre-migration-linux.yml post-migration-linux.yml
+```
+
+---
+
+## Check Catalog
+
+---
+
+## `pre-migration-linux.yml`
+
+Run **before** virt-v2v conversion while the VM is still on VMware vSphere.
+
+### Fact Gathering
+
+| Task | Description |
+|------|-------------|
+| Gather Facts | Collects OS and hardware facts via `ansible.builtin.setup` |
+| Gather Packages | Collects installed package list via `package_facts` |
+| Gather Services | Collects systemd service states via `service_facts` |
+| INFO OS | Logs distribution name and version |
+
+### CRITICAL — Boot / Conversion Blockers
+
+| Check | Description |
+|-------|-------------|
+| Check Root Filesystem Is Not BTRFS | Fails if the root (`/`) mount point uses the btrfs filesystem |
+| Check No BTRFS Filesystems Mounted | Fails if any mounted filesystem uses btrfs |
+| Valid Platform | Fails if `VMware` is not present in `product_name` — confirms VM is on vSphere |
+| Check open-vm-tools daemon is running | Fails if neither `open-vm-tools.service` nor `vmtoolsd.service` is in running state |
+| Check GRUB configs use UUID for root disk | Fails if any grub.cfg file references `/dev/sd*`, `/dev/vd*`, or `/dev/xvd*` instead of UUID |
+| Check fstab uses UUIDs for mount points | Fails if `/etc/fstab` has non-commented entries using `/dev/sd*` device paths |
+| Check GRUB_CMDLINE_LINUX uses UUID | Fails if `/etc/default/grub` contains `root=/dev/sd*` in the kernel command line |
+| Check virtio drivers are in initramfs | Fails if `virtio_blk`, `virtio_scsi`, or `virtio_net` are missing from the RHEL initramfs image |
+| Check virtio drivers are in initramfs (Debian) | Fails if virtio drivers are missing from the Debian/Ubuntu initrd image |
+| Check running kernel cmdline uses UUID | Fails if `/proc/cmdline` shows the running kernel was booted with a `/dev/sd*` root device path |
+| Check for LUKS encrypted volumes | Fails if any block device has LUKS encryption — passphrase/keyfile availability must be confirmed |
+| Check for software RAID arrays | Fails if `/proc/mdstat` shows active mdadm RAID arrays that may desync on device rename |
+| Check kernel version is compatible | Fails if kernel version is below 3.10, the minimum for virtio driver support |
+| Check if system boots via UEFI | Detects UEFI vs BIOS boot mode by checking `/sys/firmware/efi` |
+| Check Secure Boot state | Fails if Secure Boot is enabled — virtio drivers must be signed for the target platform |
+| Check EFI System Partition is mounted and healthy | Fails if UEFI system's `/boot/efi` is not mounted as `vfat` |
+| Check for ZFS filesystems | Fails if ZFS is loaded or pools exist — virt-v2v cannot convert ZFS volumes |
+| Check VMware paravirtual SCSI (pvscsi) driver is loaded | Fails if `pvscsi` module is not loaded — inventories the storage adapter type |
+| Check VMware memory balloon (vmmemctl) driver is loaded | Fails if `vmmemctl` module is not loaded — inventories balloon driver presence |
+| Check VMware VMCI and vSock modules are loaded | Fails if `vmci` or `vmw_vsock_vmci_transport` modules are not loaded |
+| Check dracut is configured to include virtio modules | Fails if no dracut config references virtio — initramfs rebuilds will omit virtio drivers (RHEL only) |
+
+### HIGH — Post-Migration Failures
+
+| Check | Description |
+|-------|-------------|
+| OS VMware Tools | Fails if `open-vm-tools` package is not installed |
+| Package ubuntu-minimal Is Present | Fails if `ubuntu-minimal` is absent on Ubuntu systems |
+| Check for NFS/CIFS mounts in fstab | Fails if fstab contains NFS or CIFS mounts that may not exist in the target environment |
+| Check for multipath configuration | Fails if multipath is active — WWID-based naming may break if disk topology changes |
+| Check SELinux mode | Reports current SELinux mode; warns if Enforcing without autorelabel |
+| Check for GRUB password protection | Fails if GRUB is password-protected — boot may fail if password is not preserved |
+| Check for VMware legacy tools daemon | Fails if `/usr/bin/vmware-toolsd` exists — conflicts with `open-vm-tools` |
+| Check SELinux autorelabel requirement | Warns if SELinux is Enforcing that `/.autorelabel` must be created before migration |
+| Check root filesystem free space | Fails if root filesystem has less than 1 GB free — virt-v2v needs space for conversion |
+| Check for hardcoded MAC addresses in ifcfg files | Fails if `HWADDR=` entries are found in RHEL network config — breaks after MAC change |
+| Check for hardcoded MAC addresses in Debian network config | Fails if `hwaddress` or `mac-address` entries found in Debian network config |
+| Check for immutable files | Fails if any file in `immutable_files_list` has the immutable attribute set |
+| Check for OverlayFS mounts | Fails if OverlayFS mounts are active — cannot be block-copied by virt-v2v |
+| Check FIPS mode | Fails if FIPS mode is enabled — initramfs rebuild may break the FIPS integrity chain |
+| Check for NSX or vShield agent packages | Fails if VMware NSX or vShield packages are installed — hypervisor-coupled, fail on KVM |
+| Check for VMware Horizon or VDI agent packages | Fails if VMware Horizon or View agent is installed — non-functional on KVM |
+| Check for running database services | Fails if MySQL, MariaDB, PostgreSQL, Oracle, or MongoDB are running without a quiesce plan |
+| Check qemu-guest-agent is available in repos (RHEL) | Fails if `qemu-guest-agent` is not available in configured yum repositories |
+| Check qemu-guest-agent is available in repos (Debian) | Fails if `qemu-guest-agent` is not available in configured apt repositories |
+
+### MEDIUM — Post-Migration Degradation
+
+| Check | Description |
+|-------|-------------|
+| Check for bonding configurations | Fails if bond/slave network config is found (RHEL) — breaks after MAC address changes |
+| Check for bridge configurations | Fails if bridge config is found (Debian) — breaks after MAC address changes |
+| Check for hardware-specific udev rules | Fails if udev rules reference specific hardware IDs, MACs, or VMware/e1000 drivers |
+| Check partition table type | Fails if primary disk uses MBR partition table instead of GPT |
+| Check for network config conflicts | Fails if NetworkManager and ifupdown are both active simultaneously (RHEL) |
+| Check NTP is configured | Fails if no NTP or chrony service is active — clock drift causes auth failures post-migration |
+| Check for non-virtio network drivers | Fails if lspci shows e1000, vmxnet, or igb adapters that virt-v2v must convert |
+| Check for LVM thin provisioning | Fails if LVM thin-provisioned logical volumes are present — can cause conversion issues |
+| Check for stale mount entries in mtab | Fails if `/etc/mtab` contains `/dev/sd*` entries from the old hypervisor |
+| Check cloud-init datasource configuration | Fails if cloud-init is configured with a hypervisor-specific datasource (NoCloud, ConfigDrive, Ec2) |
+| Check for hypervisor-specific kernel modules | Fails if vmxnet, vmware, lpfc, qla2xxx, bnx2, or ixgbe modules are loaded |
+| Check for persistent net rules | Fails if `70-persistent-net.rules` exists — hardcodes MAC-to-interface bindings |
+| Check for hardware-dependent systemd units | Fails if systemd units have `After=/dev/` or `Requires=/dev/` dependencies |
+| Check for VMware Tools kernel module conflicts | Fails if vmxnet, pvscsi, or vmhgfs modules are loaded alongside `open-vm-tools` |
+| Check root filesystem resize capability | Fails if root filesystem is ext2 or ext3 — may not support online resize |
+| Check GRUB video configuration | Fails if GRUB has `GRUB_GFXMODE` or `GRUB_GFXPAYLOAD` — incompatible with KVM display |
+| Check resolv.conf is managed | Fails if `/etc/resolv.conf` is not managed by NetworkManager or dhclient |
+| Check Netplan configuration is valid | Fails if `netplan info` returns non-zero exit code (Ubuntu only) |
+| Check for huge pages configuration | Fails if huge pages are reserved — NUMA topology may differ on the KVM host |
+| Check AppArmor profiles for /dev/sd* references | Fails if AppArmor profiles reference `/dev/sd*` — may deny access to `/dev/vd*` post-migration |
+| Check auditd rules for /dev/sd* references | Fails if auditd rules reference `/dev/sd*` — will fail silently after device rename |
+| Check for real-time kernel | Fails if an RT kernel is in use — virtio driver compatibility may be affected |
+| Check for VMware-integrated backup agent packages | Fails if Veeam, Commvault, or NetBackup agents are installed — lose vSphere snapshot integration |
+| Check for SR-IOV or PCI passthrough devices | Fails if SR-IOV or VFIO passthrough is in use — not portable without KubeVirt device plugin |
+| Check for hardcoded MAC addresses in ifcfg files | Fails if RHEL ifcfg files contain `HWADDR=` entries |
+| Check for hardcoded MAC addresses in Debian network config | Fails if Debian network config contains `hwaddress` or `mac-address` entries |
+
+### LOW — Operational Concerns
+
+| Check | Description |
+|-------|-------------|
+| Check for problematic cron entries | Fails if cron jobs reference `/dev/sd*`, NFS mounts, or external hostnames |
+| Check for Docker host device mounts | Fails if running Docker containers have `/dev/` bind mounts |
+| Check for legacy network interface naming | Fails if interfaces use legacy `eth0`-style names instead of predictable names |
+| Check for software RAID arrays | Fails if active mdadm RAID arrays are present — may need resync after device rename |
+| Check disk SMART health status | Fails if disk SMART overall health is not `PASSED` |
+| Check swap uses UUID in fstab | Fails if swap entry in `/etc/fstab` uses a `/dev/sd*` path instead of UUID |
+| Check Docker storage driver | Fails if Docker uses `devicemapper` storage driver on top of LVM |
+| Check /tmp mount options | Fails if `/tmp` is mounted with `noexec` or `nosuid` — may block virt-v2v driver installation |
+| Check for syslog forwarding | Fails if rsyslog is configured to forward logs to an external host |
+| Check timezone is set to UTC | Fails if system timezone is not UTC or Etc/UTC |
+| Check for running Podman containers | Fails if Podman containers are running — stop before migration for filesystem consistency |
+| Check for running Docker containers | Fails if Docker containers are running — stop before migration for filesystem consistency |
+| Check for virt-who VMware configuration | Fails if virt-who is configured for VMware — RHEL subscription needs re-registration post-migration |
+| Check for non-standard MTU configuration | Fails if any interface has a non-standard MTU — may cause fragmentation on OVN overlay (MTU 1400) |
+| Check cloud-init VMwareGuestInfo datasource is configured | Fails if cloud-init does not have `VMwareGuestInfo` datasource — network may not initialize on first boot in OpenShift Virtualization |
+
+### Informational Only
+
+| Task | Description |
+|------|-------------|
+| INFO Boot mode | Logs whether system uses UEFI or BIOS/Legacy boot |
+| INFO Total provisioned disk size | Logs total GB across all disk devices — used to plan conversion storage |
+| INFO Network interface count | Logs number of non-loopback interfaces |
+| Warn if multiple NICs detected | Warns if more than 1 NIC is present — each must be mapped in KubeVirt VM spec |
+| INFO Static IP files found | Logs paths to static IP configuration files found |
+| INFO Huge pages total | Logs total huge pages reserved |
+| INFO journald storage mode | Warns if journald uses persistent storage — consider volatile before migration |
+| INFO Total disk utilization | Logs total used disk space across all filesystems |
+| INFO MTU values | Logs interfaces with non-standard MTU values |
+
+---
+
+## `post-migration-linux.yml`
+
+Run **after** virt-v2v conversion once the VM has booted on KVM / OpenShift Virtualization.
+
+### Fact Gathering
+
+| Task | Description |
+|------|-------------|
+| Gather Facts | Collects OS and hardware facts via `ansible.builtin.setup` |
+| Gather Packages | Collects installed package list via `package_facts` |
+| Gather Services | Collects systemd service states via `service_facts` |
+| INFO OS | Logs distribution, version, and kernel |
+
+### CRITICAL — Must Pass Before VM Is Considered Migrated
+
+| Check | Description |
+|-------|-------------|
+| Check platform is KVM (not VMware) | Fails if `VMware` is still present in `product_name` — confirms VM is no longer on vSphere |
+| Check VMware kernel modules are not loaded | Fails if any VMware kernel module (vmxnet, pvscsi, vmmemctl, vmci, vmw_vsock, vmw_balloon) is still loaded |
+| Check virtio_blk or virtio_scsi driver is loaded | Fails if neither `virtio_blk` nor `virtio_scsi` is loaded — VM cannot access its disk |
+| Check virtio_net driver is loaded | Fails if `virtio_net` is not loaded — VM has no functional network driver |
+| Check root disk is virtio (vda/vdb or virtio-scsi) | Fails if all disk devices are still `/dev/sd*` instead of `/dev/vd*` |
+| Check primary NIC uses virtio_net driver | Fails if any non-loopback interface is not driven by `virtio_net` |
+| Check open-vm-tools package is removed | Fails if `open-vm-tools` is still installed |
+| Check vmtoolsd service is not running | Fails if `open-vm-tools.service` or `vmtoolsd.service` is still in running state |
+| Check fstab has no stale /dev/sd* references | Fails if `/etc/fstab` still contains `/dev/sd*` or `/dev/xvd*` device paths |
+
+### HIGH — Post-Migration Operational Readiness
+
+| Check | Description |
+|-------|-------------|
+| Check qemu-guest-agent is installed | Fails if `qemu-guest-agent` package is not present — required for OCP-V lifecycle management |
+| Check qemu-guest-agent service is running | Fails if `qemu-guest-agent.service` is not in running state |
+| Check VMware Tools binary is absent | Fails if `/usr/bin/vmware-toolsd` still exists on disk |
+| Check VMware Tools config directory is absent | Fails if `/etc/vmware-tools` directory still exists |
+| Check VMware ProgramData directory is absent | Fails if `/usr/lib/vmware-tools` still exists |
+| Check for remaining VMware packages (RHEL) | Fails if any VMware or open-vm-tools RPM packages are still installed |
+| Check for remaining VMware packages (Debian) | Fails if any VMware or open-vm-tools Debian packages are still installed |
+| Check for leftover VMware udev rules | Fails if any udev rules in `/etc/udev/rules.d/` reference vmware, vmxnet, or pvscsi |
+| Check persistent net rules are absent | Fails if `70-persistent-net.rules` still exists — hardcoded MAC bindings break new interface names |
+| Check FQDN resolves | Fails if `getent hosts $(hostname -f)` returns no result — DNS is broken |
+| Check NTP/chrony service is running | Fails if no NTP or chrony service is active — clock drift breaks TLS and Kerberos |
+| Check cloud-init status | Fails if cloud-init is installed but did not complete with `status: done` |
+| Check SELinux autorelabel file is consumed | Fails if `/.autorelabel` still exists — SELinux relabeling did not run on first boot |
+
+### MEDIUM — Operational Quality
+
+| Check | Description |
+|-------|-------------|
+| Check hostname matches inventory | Fails if `ansible_hostname` does not match the inventory hostname short name |
+| Check SSH host keys exist | Fails if no SSH host keys are present in `/etc/ssh/` |
+| Check root filesystem free space post-migration | Fails if root filesystem has less than 1 GB free after conversion |
+| Check GRUB config has no VMware-specific kernel args | Fails if grub.cfg still contains vmware, open-vm-tools, or vmxnet references |
+| Check virtio_balloon driver is loaded | Fails if `virtio_balloon` is not loaded — memory ballooning is inactive |
+| Check default route exists | Fails if `ip route show default` returns no route — network is misconfigured |
+
+### LOW — Platform Integration
+
+| Check | Description |
+|-------|-------------|
+| Check virtio-serial device exists for qemu-guest-agent | Fails if `/dev/virtio-ports/` is absent — qemu-guest-agent cannot communicate with the hypervisor |
+| Check for leftover VMware snapshot/delta files | Fails if any `.vmdk` files are found on disk outside `/proc`, `/sys`, or `/dev` |
+| Check dmesg for KVM or virtio errors | Fails if dmesg contains error, fail, panic, or oops messages related to KVM or virtio |
+
+### Informational Only
+
+| Task | Description |
+|------|-------------|
+| INFO Hypervisor | Logs hypervisor type detected by `systemd-detect-virt` |
+| INFO Detected virtualization type | Logs the raw output of `systemd-detect-virt` |
+| INFO Disk devices detected | Logs all non-optical disk device names |
+| INFO NIC drivers detected | Logs each interface name and its kernel driver |
+| INFO FQDN resolution result | Logs the resolved IP address for the VM's FQDN |
+| INFO SELinux mode post-migration | Logs current SELinux mode (Enforcing / Permissive / Disabled) |
+| INFO Root filesystem usage | Logs `df -h /` output |
+| INFO Filesystem usage detail | Logs full `df -h /` output lines |
+| INFO Default route | Logs the active default route |
+| INFO IP addresses | Logs all IPv4 addresses assigned to the VM |
+| INFO dmesg KVM/virtio messages | Logs any KVM/virtio-related dmesg lines (only when errors are found) |
+| INFO Kernel version | Logs the running kernel version |

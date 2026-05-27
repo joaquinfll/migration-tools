@@ -1,0 +1,14 @@
+---
+# No Galaxy collections required.
+# All tasks use ansible.builtin modules shipped with ansible-core >= 2.14.
+#
+# Install the required Ansible version (recommended):
+#   pipx install ansible-core
+#
+# Or with pip:
+#   python3 -m pip install --user ansible-core
+#
+# Optional linting:
+#   python3 -m pip install --user ansible-lint
+
+collections: []
