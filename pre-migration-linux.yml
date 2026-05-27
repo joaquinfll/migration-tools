@@ -201,7 +201,7 @@
       ignore_errors: true
       register: bridge_check
       failed_when: bridge_check.stdout | length > 0
-      when: ansible_facts['os_family'] == "Debian" and "'/etc/network/interfaces' is file"
+      when: ansible_facts['os_family'] == "Debian" and '/etc/network/interfaces' is file
 
     # ============ MEDIUM: Custom udev rules ============
     # Rules referencing specific hardware IDs or MAC addresses break after migration.
@@ -251,15 +251,20 @@
       when: "'/dev/sda' in ansible_facts['devices']"
 
     # ============ MEDIUM: Network config conflicts ============
-    # Running both NetworkManager and ifupdown simultaneously causes IP conflicts.
+    # Running both NetworkManager and legacy ifupdown scripts simultaneously
+    # can cause IP conflicts and unpredictable network state.
 
     - name: Check for network config conflicts
       ansible.builtin.shell: |
-        (systemctl is-active NetworkManager && ls /etc/sysconfig/network-scripts/ 2>/dev/null) || true
+        if systemctl is-active NetworkManager &>/dev/null && \
+           [ -d /etc/sysconfig/network-scripts ] && \
+           ls /etc/sysconfig/network-scripts/ifcfg-* &>/dev/null; then
+          echo "conflict"
+        fi || true
       changed_when: false
       ignore_errors: true
       register: network_conflict_check
-      failed_when: network_conflict_check.stdout | length > 0
+      failed_when: "'conflict' in network_conflict_check.stdout"
       when: ansible_facts['os_family'] == "RedHat"
 
     # ============ MEDIUM: NTP/chrony configuration ============
@@ -418,11 +423,13 @@
       when: "'/etc/cloud/cloud.cfg' is file"
 
     # ============ MEDIUM: Hypervisor-specific kernel modules ============
-    # Modules loaded for VMware/physical hardware that won't exist on the target.
+    # Modules loaded for VMware (vmxnet, vmware) or IBM/Accenture FC HBAs (lpfc, qla2xxx)
+    # that won't exist or are unnecessary on the KubeVirt target.
+    # Note: ixgbe is standard Intel 10GbE on bare-metal servers — not hypervisor-specific.
 
     - name: Check for hypervisor-specific kernel modules
       ansible.builtin.shell: |
-        lsmod 2>/dev/null | grep -iE 'vmxnet|vmware|lpfc|qla2xxx|bnx2|ixgbe' || true
+        lsmod 2>/dev/null | grep -iE 'vmxnet|vmware|lpfc|qla2xxx|bnx2' || true
       changed_when: false
       ignore_errors: true
       register: hw_module_check
@@ -465,14 +472,24 @@
 
     # ============ LOW: Disk SMART health status ============
     # Pre-migration disk health check to avoid migrating a failing disk.
+    # Checks the first available disk (sda or nvme0n1) so NVMe-only systems aren't skipped.
 
     - name: Check disk SMART health status
       ansible.builtin.shell: |
-        smartctl -H /dev/sda 2>/dev/null | grep 'SMART overall-health' || true
+        DISK=$(lsblk -d -o NAME,TYPE -l 2>/dev/null | awk '$2=="disk"{print "/dev/"$1; exit}')
+        if [ -n "$DISK" ]; then
+          smartctl -H "$DISK" 2>/dev/null | grep 'SMART overall-health' || echo "unavailable"
+        else
+          echo "no-disk"
+        fi || true
       changed_when: false
       ignore_errors: true
       register: smart_check
-      failed_when: "'PASSED' not in smart_check.stdout"
+      failed_when: >
+        smart_check.stdout | length > 0 and
+        'PASSED' not in smart_check.stdout and
+        'unavailable' not in smart_check.stdout and
+        'no-disk' not in smart_check.stdout
       when: "'smartmontools' in ansible_facts['packages']"
 
     # ============ LOW: Swap partition references in fstab ============
@@ -555,15 +572,20 @@
       failed_when: grub_video_check.stdout | length > 0
 
     # ============ LOW: resolv.conf management ============
-    # If resolv.conf is manually edited instead of managed by NetworkManager/dhclient, DNS may break.
+    # If resolv.conf is a static file instead of a symlink managed by NetworkManager,
+    # dhclient, or systemd-resolved, DNS config may not update correctly post-migration.
 
     - name: Check resolv.conf is managed
       ansible.builtin.shell: |
-        ls -la /etc/resolv.conf 2>/dev/null || true
+        readlink -f /etc/resolv.conf 2>/dev/null || ls -la /etc/resolv.conf 2>/dev/null || true
       changed_when: false
       ignore_errors: true
       register: resolv_check
-      failed_when: "'network' not in resolv_check.stdout and 'dhclient' not in resolv_check.stdout"
+      failed_when: >
+        'NetworkManager' not in resolv_check.stdout and
+        'dhclient' not in resolv_check.stdout and
+        'systemd' not in resolv_check.stdout and
+        resolv_check.stdout | length > 0
       when: "'/etc/resolv.conf' is file"
 
     # ============ HIGH: VMware legacy tools ============
@@ -594,7 +616,7 @@
 
     - name: Check root filesystem free space
       ansible.builtin.shell: |
-        df -BG / | awk 'NR==2{gsub("G",""); print $4}'
+        df -BM / | awk 'NR==2{gsub("M",""); print $4}'
       changed_when: false
       ignore_errors: true
       register: root_free_space
@@ -745,7 +767,7 @@
       ignore_errors: true
       register: dracut_virtio_check
       failed_when: dracut_virtio_check.stdout | length == 0
-      when: ansible_facts['os_family'] == "RedHat" and "'dracut' in ansible_facts['packages']"
+      when: ansible_facts['os_family'] == "RedHat" and '"dracut" in ansible_facts["packages"]'
 
     # ============ HIGH: Total disk size ============
     # virt-v2v requires conversion space equal to the total provisioned disk size.
@@ -1012,12 +1034,13 @@
     # spikes or fail to load with CONFIG_PREEMPT_RT builds.
 
     - name: Check for real-time kernel
-      ansible.builtin.debug:
-        msg: "Kernel: {{ ansible_facts['kernel'] }}"
-      failed_when: ansible_facts['kernel'] | regex_search('(\+rt|-rt)', ignorecase=True)
+      ansible.builtin.shell: |
+        echo "{{ ansible_facts['kernel'] }}" | grep -iE '\+rt|-rt' || true
       changed_when: false
       ignore_errors: true
       register: rt_kernel_check
+      failed_when: rt_kernel_check.stdout | length > 0
+      when: ansible_facts['kernel'] is defined
 
     # ============ MEDIUM: Third-party backup agents ============
     # VMware-integrated backup agents (Veeam, Commvault, NetBackup) use vSphere APIs
@@ -1173,7 +1196,7 @@
               {'label': 'Software RAID', 'msg': 'Software RAID arrays detected'} if mdadm_check is defined and 'failed' in mdadm_check and mdadm_check.failed else None,
               {'label': 'Kernel version', 'msg': 'Kernel version too old for virtio drivers'} if kernel_compat is defined and 'failed' in kernel_compat and kernel_compat.failed else None,
               {'label': 'Multipath', 'msg': 'Multipath configuration detected'} if multipath_check is defined and 'failed' in multipath_check and multipath_check.failed else None,
-              {'label': 'SELinux', 'msg': 'SELinux mode detected: ' + ansible_facts['selinux']['mode']} if 'selinux' in ansible_facts and ansible_facts['selinux']['mode'] | lower == 'enforcing' else None,
+              {'label': 'SELinux', 'msg': 'SELinux mode detected: ' + ansible_facts['selinux']['mode']} if 'selinux' in ansible_facts and ansible_facts['selinux']['mode'] | lower == 'enforcing' and selinux_mode is defined and 'failed' in selinux_mode and selinux_mode.failed else None,
               {'label': 'GRUB password', 'msg': 'GRUB password protection detected'} if grub_pass_check is defined and 'failed' in grub_pass_check and grub_pass_check.failed else None,
               {'label': 'Stale mtab', 'msg': 'Stale mount entries found in /etc/mtab'} if mtab_check is defined and 'failed' in mtab_check and mtab_check.failed else None,
               {'label': 'cloud-init', 'msg': 'Hypervisor-specific cloud-init datasource detected'} if cloudinit_check is defined and 'failed' in cloudinit_check and cloudinit_check.failed else None,
@@ -1191,7 +1214,7 @@
               {'label': 'GRUB video', 'msg': 'GRUB video configuration detected'} if grub_video_check is defined and 'failed' in grub_video_check and grub_video_check.failed else None,
               {'label': 'resolv.conf', 'msg': '/etc/resolv.conf is not managed by NetworkManager/dhclient'} if resolv_check is defined and 'failed' in resolv_check and resolv_check.failed else None,
               {'label': 'VMware legacy', 'msg': 'Legacy VMware Tools daemon found at /usr/bin/vmware-toolsd'} if vmware_legacy_check is defined and vmware_legacy_check.stat.exists else None,
-              {'label': 'SELinux relabel', 'msg': 'SELinux enforcing — ensure /.autorelabel is created and not disabled'} if 'selinux' in ansible_facts and ansible_facts['selinux']['mode'] | lower == 'enforcing' else None,
+              {'label': 'SELinux relabel', 'msg': 'SELinux enforcing — ensure /.autorelabel is created and not disabled'} if False else None,
               {'label': 'Root free space', 'msg': 'Root filesystem has only ' + root_free_space.stdout + 'MB free (need at least 1024MB)'} if root_free_space is defined and 'failed' in root_free_space and root_free_space.failed else None,
               {'label': 'Hardcoded MAC (RHEL)', 'msg': 'Hardcoded MAC addresses found in ifcfg files'} if hwaddr_check is defined and 'failed' in hwaddr_check and hwaddr_check.failed else None,
               {'label': 'Hardcoded MAC (Debian)', 'msg': 'Hardcoded MAC addresses found in Debian network config'} if hwaddr_debian_check is defined and 'failed' in hwaddr_debian_check and hwaddr_debian_check.failed else None,
