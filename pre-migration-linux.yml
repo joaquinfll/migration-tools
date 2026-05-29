@@ -598,16 +598,17 @@
       register: vmware_legacy_check
       changed_when: false
 
-    # ============ HIGH: SELinux autorelabel requirement ============
-    # When SELinux is enforcing, the migrated VM needs /.autorelabel to relabel files.
+    # ============ HIGH: SELinux autorelabel notification ============
+    # virt-v2v automatically handles SELinux relabeling during conversion.
+    # The first boot on KVM may take longer while relabeling completes.
 
-    - name: Check SELinux autorelabel requirement
+    - name: Check SELinux autorelabel notification
       ansible.builtin.debug:
         msg: |
-          SELinux is enforcing. Ensure the following before migration:
-          - Create /.autorelabel file (touch /.autorelabel)
-          - Do NOT disable selinux autorelabel in kernel cmdline
-          - First boot will take longer for relabeling
+          SELinux is enforcing. virt-v2v will handle SELinux relabeling automatically during conversion.
+          - No manual action is required before migration
+          - First boot on KVM may take longer while relabeling completes
+          - Verify relabeling completed successfully using the post-migration playbook
       when: "'selinux' in ansible_facts and ansible_facts['selinux']['mode'] | lower == 'enforcing'"
       changed_when: false
 

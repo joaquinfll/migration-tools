@@ -1,5 +1,6 @@
 # Ansible local cache (tmp files, facts cache, collections cache)
 .ansible/
+.tools/
 
 # Ansible retry files
 *.retry
