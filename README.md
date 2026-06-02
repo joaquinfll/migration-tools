@@ -14,6 +14,7 @@ All playbooks follow the same pattern: every check runs with `ignore_errors: tru
 | SSH access | Linux target VM must be reachable over SSH |
 | WinRM access | Windows target VM must have WinRM enabled (HTTP port 5985 or HTTPS port 5986) |
 | `ansible.windows` collection | ≥ 2.0.0 — required for Windows playbooks only |
+| `community.vmware` collection | ≥ 6.2.0 — required for vSphere-only playbooks (`cbt-enable.yml`) |
 
 Install Galaxy collections after cloning:
 
@@ -140,12 +141,41 @@ ansible-playbook -i inventory post-migration-windows.yml
 ansible-playbook -i inventory post-migration-windows.yml --limit winvm.example.com
 ```
 
+### vSphere — Enable CBT (`cbt-enable.yml`)
+
+Enables Changed Block Tracking (CBT) on all compatible disks across one or more VMs.
+Requires vCenter credentials; does **not** need SSH/WinRM access to the guest VMs.
+
+```bash
+# Single VM (default)
+ansible-playbook cbt-enable.yml \
+  -e vcenter_hostname=vcenter.example.com \
+  -e vcenter_username=admin@vsphere.local \
+  -e vcenter_password='password'
+
+# Multiple VMs
+ansible-playbook cbt-enable.yml \
+  -e vcenter_hostname=vcenter.example.com \
+  -e vcenter_username=admin@vsphere.local \
+  -e vcenter_password='password' \
+  -e vm_list='["web-01","web-02","db-01"]'
+
+# Custom datacenter and snapshot name
+ansible-playbook cbt-enable.yml \
+  -e vcenter_hostname=vcenter.example.com \
+  -e vcenter_username=admin@vsphere.local \
+  -e vcenter_password='password' \
+  -e dc_name='Production-DC' \
+  -e snapshot_name='cbt-activation-$(date +%s)'
+```
+
 ### Lint
 
 ```bash
 python3 -m pip install --user ansible-lint
 ansible-lint pre-migration-linux.yml post-migration-linux.yml \
-             pre-migration-windows.yml post-migration-windows.yml
+             pre-migration-windows.yml post-migration-windows.yml \
+             cbt-enable.yml
 ```
 
 ---
@@ -243,7 +273,7 @@ Run **before** virt-v2v conversion while the VM is still on VMware vSphere.
 | Check AppArmor profiles for /dev/sd* references | Fails if AppArmor profiles reference `/dev/sd*` — may deny access to `/dev/vd*` post-migration |
 | Check auditd rules for /dev/sd* references | Fails if auditd rules reference `/dev/sd*` — will fail silently after device rename |
 | Check for real-time kernel | Fails if an RT kernel is in use — virtio driver compatibility may be affected |
-| Check for VMware-integrated backup agent packages | Fails if Veeam, Commvault, or NetBackup agents are installed — lose vSphere snapshot integration |
+| Check for VMware-integrated backup agent packages | Fails if hypervisor-coupled backup agents are installed — lose vSphere snapshot integration |
 | Check for SR-IOV or PCI passthrough devices | Fails if SR-IOV or VFIO passthrough is in use — not portable without KubeVirt device plugin |
 | Check for hardcoded MAC addresses in ifcfg files | Fails if RHEL ifcfg files contain `HWADDR=` entries |
 | Check for hardcoded MAC addresses in Debian network config | Fails if Debian network config contains `hwaddress` or `mac-address` entries |
@@ -493,3 +523,63 @@ Requires WinRM access and the `ansible.windows` collection.
 | INFO IP addresses | Logs all IPv4 addresses assigned to the VM |
 | INFO DNS resolution result | Logs the IP returned for the hostname lookup |
 | INFO Windows version | Logs Windows edition, version number, and kernel build |
+
+---
+
+## `cbt-enable.yml`
+
+Enables **Changed Block Tracking (CBT)** on all compatible disks across one or more VMware VMs.
+CBT is a prerequisite for the **OpenShift Migration Toolkit for Virtualization (MTV)** and other incremental replication workflows.
+
+This playbook runs entirely against vCenter — **no SSH or WinRM access to guest VMs is needed**.
+
+### How It Works
+
+1. **Discovers disks** — Queries vCenter for each VM's disk inventory via `vmware_guest_disk_info`.
+2. **Filters compatible disks** — Excludes disks that cannot use CBT:
+   - Independent persistent/non-persistent disks (`independent_*` backing mode)
+   - Raw Device Mapping (RDM) disks (`RawDiskMappingVer1` backing type)
+3. **Maps controller types** — Translates VMware controller types to VMX config prefixes:
+   - `paravirtual`, `lsilogic`, `lsilogic-sas` → `scsi`
+   - `sata` → `sata`
+   - `nvme` → `nvme`
+4. **Applies settings** — Sets `ctkEnabled` globally and per-disk (e.g., `scsi0:0.ctkEnabled`) via `vmware_guest` advanced settings.
+5. **Activates via snapshot cycle** — Creates then immediately removes a temporary snapshot to trigger the CBT stun/unstun cycle without a power cycle.
+
+### Variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `vcenter_hostname` | Yes | — | vCenter Server hostname or IP |
+| `vcenter_username` | Yes | — | vCenter username (e.g., `admin@vsphere.local`) |
+| `vcenter_password` | Yes | — | vCenter password |
+| `vm_list` | No | `["my-vm"]` | List of VM names to enable CBT on |
+| `dc_name` | No | `"my-datacenter"` | vCenter datacenter name |
+| `snapshot_name` | No | `"cbt-activation"` | Name of the temporary snapshot created during activation |
+
+### Tasks
+
+| Task | Module | Description |
+|------|--------|-------------|
+| Get disk info | `vmware_guest_disk_info` | Queries vCenter for each VM's disk inventory (controller type, unit number, backing mode) |
+| Filter CBT-compatible disks | `set_fact` + `json_query` | Excludes `independent_*` disk modes and RDM disks; maps controller types to VMX prefixes |
+| Build CBT advanced settings | `set_fact` + Jinja2 | Constructs the `advanced_settings` list with global `ctkEnabled` + per-disk entries |
+| Apply CBT settings | `vmware_guest` | Writes the advanced settings to the VM's VMX config |
+| Create snapshot | `vmware_guest_snapshot` | Creates a temporary snapshot to trigger CBT activation (skipped if no compatible disks) |
+| Remove snapshot | `vmware_guest_snapshot` | Removes the temporary snapshot immediately after creation |
+
+### Disk Compatibility
+
+| Disk type | CBT supported | Action |
+|---|---|---|
+| Persistent (FlatVer2, SparseVer1, EnhancedSparse) | Yes | CBT enabled |
+| Dependent persistent/non-persistent | Yes | CBT enabled |
+| Independent persistent | No | Skipped |
+| Independent non-persistent | No | Skipped |
+| RDM (RawDiskMappingVer1) | No | Skipped |
+
+### Notes
+
+- The snapshot activation cycle requires the VM to have snapshot capability enabled. If snapshots are disabled on a VM, the activation tasks will be skipped when no compatible disks are found.
+- CBT settings take effect after the snapshot stun/unstun cycle. A VM power cycle is an alternative but more disruptive activation method.
+- For VMs with no compatible disks (all disks are independent or RDM), the playbook skips the snapshot cycle entirely.

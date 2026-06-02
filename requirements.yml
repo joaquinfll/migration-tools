@@ -5,6 +5,9 @@
 # Windows playbooks require:
 #   ansible.windows  — win_shell, win_service_info, win_copy, etc.
 #
+# VMware vSphere playbooks (cbt-enable.yml) require:
+#   community.vmware  — vmware_guest, vmware_guest_disk_info, vmware_guest_snapshot
+#
 # Install the required Ansible version (recommended):
 #   pipx install ansible-core
 #
@@ -20,3 +23,5 @@
 collections:
   - name: ansible.windows
     version: ">=2.0.0"
+  - name: community.vmware
+    version: ">=6.2.0"

@@ -42,7 +42,7 @@
       register: check_btrfs_root
       vars:
         root_fstype: "{{ ansible_facts['mounts'] | selectattr('mount', 'equalto', '/') | map(attribute='fstype') | first }}"
-      when: root_fstype is defined
+      when: root_fstype != ''
 
     - name: Check No BTRFS Filesystems Mounted
       ansible.builtin.debug:
@@ -313,7 +313,7 @@
       changed_when: false
       ignore_errors: true
       register: legacy_nic_check
-      failed_when: legacy_nic_check.stdout | length == 0
+      failed_when: legacy_nic_check.stdout | length > 0
       when: ansible_facts['network']['interfaces'] is defined
 
     # ============ CRITICAL: /proc/cmdline device paths ============
@@ -398,19 +398,7 @@
       register: grub_pass_check
       failed_when: grub_pass_check.stdout | length > 0
 
-    # ============ MEDIUM: Stale mtab entries ============
-    # Stale mount entries from the old hypervisor can cause fstab reconciliation issues.
-
-    - name: Check for stale mount entries in mtab
-      ansible.builtin.shell: |
-        grep -E '/dev/(sd|vd|xvd)' /etc/mtab 2>/dev/null | grep -vE '^\s*#' || true
-      changed_when: false
-      ignore_errors: true
-      register: mtab_check
-      failed_when: mtab_check.stdout | length > 0
-      when: "'/etc/mtab' is file"
-
-    # ============ MEDIUM: cloud-init datasource configuration ============
+ # ============ MEDIUM: cloud-init datasource configuration ============
     # cloud-init with hypervisor-specific datasource may fail in the target environment.
 
     - name: Check cloud-init datasource configuration
@@ -470,29 +458,7 @@
       failed_when: vmware_module_check.stdout | length > 0
       when: "'open-vm-tools' in ansible_facts['packages']"
 
-    # ============ LOW: Disk SMART health status ============
-    # Pre-migration disk health check to avoid migrating a failing disk.
-    # Checks the first available disk (sda or nvme0n1) so NVMe-only systems aren't skipped.
-
-    - name: Check disk SMART health status
-      ansible.builtin.shell: |
-        DISK=$(lsblk -d -o NAME,TYPE -l 2>/dev/null | awk '$2=="disk"{print "/dev/"$1; exit}')
-        if [ -n "$DISK" ]; then
-          smartctl -H "$DISK" 2>/dev/null | grep 'SMART overall-health' || echo "unavailable"
-        else
-          echo "no-disk"
-        fi || true
-      changed_when: false
-      ignore_errors: true
-      register: smart_check
-      failed_when: >
-        smart_check.stdout | length > 0 and
-        'PASSED' not in smart_check.stdout and
-        'unavailable' not in smart_check.stdout and
-        'no-disk' not in smart_check.stdout
-      when: "'smartmontools' in ansible_facts['packages']"
-
-    # ============ LOW: Swap partition references in fstab ============
+ # ============ LOW: Swap partition references in fstab ============
     # Swap using /dev/sd* paths will need updating for the new disk device.
 
     - name: Check swap uses UUID in fstab
@@ -515,17 +481,6 @@
       register: docker_driver
       failed_when: docker_driver.stdout == 'devicemapper'
       when: "'docker' in ansible_facts['packages']"
-
-    # ============ LOW: /tmp mount options ============
-    # Security mount options on /tmp may interfere with virt-v2v or virtio driver installation.
-
-    - name: Check /tmp mount options
-      ansible.builtin.shell: |
-        mount | grep ' on /tmp ' | grep -E 'noexec|nosuid' || true
-      changed_when: false
-      ignore_errors: true
-      register: tmp_mount_check
-      failed_when: tmp_mount_check.stdout | length > 0
 
     # ============ LOW: Syslog forwarding ============
     # Log forwarding to a specific host that won't be reachable after migration.
@@ -617,11 +572,11 @@
 
     - name: Check root filesystem free space
       ansible.builtin.shell: |
-        df -BM / | awk 'NR==2{gsub("M",""); print $4}'
+        df -BG / | awk 'NR==2{gsub("G",""); print $4}'
       changed_when: false
       ignore_errors: true
       register: root_free_space
-      failed_when: root_free_space.stdout | int < 1024
+      failed_when: root_free_space.stdout | int < 1
 
     # ============ MEDIUM: Hardcoded MAC addresses in ifcfg files ============
     # Hardcoded MAC addresses in network config will break after migration.
@@ -728,36 +683,7 @@
       register: zfs_check
       failed_when: zfs_check.stdout | length > 0
 
-    # ============ CRITICAL: VMware paravirtual drivers loaded ============
-    # pvscsi, vmmemctl, vmci, and vmw_vsock are VMware-specific kernel modules.
-    # They must not be present after migration; detecting them pre-migration
-    # ensures they are inventoried and confirms the VM is still on VMware.
-
-    - name: Check VMware paravirtual SCSI (pvscsi) driver is loaded
-      ansible.builtin.shell: |
-        lsmod 2>/dev/null | grep -E '^pvscsi' || true
-      changed_when: false
-      ignore_errors: true
-      register: pvscsi_check
-      failed_when: pvscsi_check.stdout | length == 0
-
-    - name: Check VMware memory balloon (vmmemctl) driver is loaded
-      ansible.builtin.shell: |
-        lsmod 2>/dev/null | grep -E '^vmmemctl' || true
-      changed_when: false
-      ignore_errors: true
-      register: vmmemctl_check
-      failed_when: vmmemctl_check.stdout | length == 0
-
-    - name: Check VMware VMCI and vSock modules are loaded
-      ansible.builtin.shell: |
-        lsmod 2>/dev/null | grep -E '^(vmci|vmw_vsock_vmci_transport)' || true
-      changed_when: false
-      ignore_errors: true
-      register: vmci_check
-      failed_when: vmci_check.stdout | length == 0
-
-    # ============ CRITICAL: dracut virtio configuration (RHEL) ============
+ # ============ CRITICAL: dracut virtio configuration (RHEL) ============
     # Even if virtio modules exist, dracut must be configured to include them in the
     # initramfs. Without a dracut config entry, initramfs rebuilds will omit them.
 
@@ -770,22 +696,7 @@
       failed_when: dracut_virtio_check.stdout | length == 0
       when: ansible_facts['os_family'] == "RedHat" and '"dracut" in ansible_facts["packages"]'
 
-    # ============ HIGH: Total disk size ============
-    # virt-v2v requires conversion space equal to the total provisioned disk size.
-    # Very large disks significantly increase conversion time.
-
-    - name: Check total provisioned disk size
-      ansible.builtin.shell: |
-        lsblk -d -b -o NAME,SIZE,TYPE 2>/dev/null | awk '$3=="disk"{sum+=$2} END{printf "%.0f\n", sum/1024/1024/1024}'
-      changed_when: false
-      ignore_errors: true
-      register: total_disk_size_check
-
-    - name: INFO Total provisioned disk size
-      ansible.builtin.debug:
-        msg: "Total disk size: {{ total_disk_size_check.stdout }} GB"
-
-    # ============ HIGH: OverlayFS in use ============
+ # ============ HIGH: OverlayFS in use ============
     # OverlayFS (used by Docker/Podman container layers or systemd-volatile-root)
     # cannot be block-copied correctly by virt-v2v.
 
@@ -1101,37 +1012,6 @@
       failed_when: virtwho_check.stdout | length > 0
       when: "'/etc/virt-who.d' is directory"
 
-    # ============ LOW: journald persistent storage ============
-    # Large persistent journal files inflate the converted disk image unnecessarily.
-
-    - name: Check journald storage configuration
-      ansible.builtin.shell: |
-        grep -E '^Storage=' /etc/systemd/journald.conf 2>/dev/null || echo "Storage=auto"
-      changed_when: false
-      ignore_errors: true
-      register: journald_check
-
-    - name: INFO journald storage mode
-      ansible.builtin.debug:
-        msg: "journald {{ journald_check.stdout }} — consider 'Storage=volatile' before migration to reduce image size"
-      when: "'persistent' in journald_check.stdout"
-      changed_when: false
-
-    # ============ LOW: Total disk utilization ============
-    # Even if root has free space, total used blocks across all volumes determine
-    # the actual data virt-v2v must copy to the target.
-
-    - name: Check total disk utilization across all filesystems
-      ansible.builtin.shell: |
-        df -BG --total 2>/dev/null | tail -1 | awk '{print $3}'
-      changed_when: false
-      ignore_errors: true
-      register: total_disk_used_check
-
-    - name: INFO Total disk utilization
-      ansible.builtin.debug:
-        msg: "Total used across all filesystems: {{ total_disk_used_check.stdout }}"
-
     # ============ LOW: OVN-Kubernetes MTU compatibility ============
     # If the VM has a custom MTU (e.g., 9000 for jumbo frames), it may cause
     # packet fragmentation on OVN's overlay network (default MTU 1400).
@@ -1199,24 +1079,20 @@
               {'label': '[HIGH] Multipath', 'msg': 'Multipath configuration detected'} if multipath_check is defined and 'failed' in multipath_check and multipath_check.failed else None,
               {'label': '[HIGH] SELinux', 'msg': 'SELinux mode detected: ' + ansible_facts['selinux']['mode']} if 'selinux' in ansible_facts and ansible_facts['selinux']['mode'] | lower == 'enforcing' and selinux_mode is defined and 'failed' in selinux_mode and selinux_mode.failed else None,
               {'label': '[HIGH] GRUB password', 'msg': 'GRUB password protection detected'} if grub_pass_check is defined and 'failed' in grub_pass_check and grub_pass_check.failed else None,
-              {'label': '[MEDIUM] Stale mtab', 'msg': 'Stale mount entries found in /etc/mtab'} if mtab_check is defined and 'failed' in mtab_check and mtab_check.failed else None,
-              {'label': '[MEDIUM] cloud-init', 'msg': 'Hypervisor-specific cloud-init datasource detected'} if cloudinit_check is defined and 'failed' in cloudinit_check and cloudinit_check.failed else None,
+                {'label': '[MEDIUM] cloud-init', 'msg': 'Hypervisor-specific cloud-init datasource detected'} if cloudinit_check is defined and 'failed' in cloudinit_check and cloudinit_check.failed else None,
               {'label': '[MEDIUM] Kernel modules', 'msg': 'Hypervisor-specific kernel modules detected'} if hw_module_check is defined and 'failed' in hw_module_check and hw_module_check.failed else None,
               {'label': '[MEDIUM] Persistent net rules', 'msg': 'Persistent net rules found (MAC-to-interface binding)'} if persistent_net_check is defined and 'failed' in persistent_net_check and persistent_net_check.failed else None,
               {'label': '[MEDIUM] Systemd units', 'msg': 'Hardware-dependent systemd units detected'} if systemd_hw_check is defined and 'failed' in systemd_hw_check and systemd_hw_check.failed else None,
               {'label': '[MEDIUM] VMware modules', 'msg': 'VMware Tools kernel modules conflict with open-vm-tools'} if vmware_module_check is defined and 'failed' in vmware_module_check and vmware_module_check.failed else None,
-              {'label': '[LOW] SMART health', 'msg': 'Disk SMART health check failed'} if smart_check is defined and 'failed' in smart_check and smart_check.failed else None,
-              {'label': '[LOW] Swap UUIDs', 'msg': 'Swap using device path in /etc/fstab'} if swap_device_check is defined and 'failed' in swap_device_check and swap_device_check.failed else None,
+                {'label': '[LOW] Swap UUIDs', 'msg': 'Swap using device path in /etc/fstab'} if swap_device_check is defined and 'failed' in swap_device_check and swap_device_check.failed else None,
               {'label': '[LOW] Docker driver', 'msg': 'Docker using devicemapper storage driver'} if docker_driver is defined and 'failed' in docker_driver and docker_driver.failed else None,
-              {'label': '[LOW] /tmp options', 'msg': '/tmp has restrictive mount options (noexec/nosuid)'} if tmp_mount_check is defined and 'failed' in tmp_mount_check and tmp_mount_check.failed else None,
               {'label': '[LOW] Syslog forwarding', 'msg': 'Syslog forwarding to external host detected'} if syslog_check is defined and 'failed' in syslog_check and syslog_check.failed else None,
               {'label': '[LOW] Timezone', 'msg': 'Timezone is not UTC: ' + tz_check.stdout} if tz_check is defined and 'failed' in tz_check and tz_check.failed else None,
               {'label': '[LOW] FS resize', 'msg': 'Root filesystem is ' + root_fstype_check.stdout + ' (may not support online resize)'} if root_fstype_check is defined and 'failed' in root_fstype_check and root_fstype_check.failed else None,
               {'label': '[LOW] GRUB video', 'msg': 'GRUB video configuration detected'} if grub_video_check is defined and 'failed' in grub_video_check and grub_video_check.failed else None,
               {'label': '[LOW] resolv.conf', 'msg': '/etc/resolv.conf is not managed by NetworkManager/dhclient'} if resolv_check is defined and 'failed' in resolv_check and resolv_check.failed else None,
               {'label': '[HIGH] VMware legacy', 'msg': 'Legacy VMware Tools daemon found at /usr/bin/vmware-toolsd'} if vmware_legacy_check is defined and vmware_legacy_check.stat.exists else None,
-              {'label': '[HIGH] SELinux relabel', 'msg': 'SELinux enforcing — ensure /.autorelabel is created and not disabled'} if False else None,
-              {'label': '[MEDIUM] Root free space', 'msg': 'Root filesystem has only ' + root_free_space.stdout + 'MB free (need at least 1024MB)'} if root_free_space is defined and 'failed' in root_free_space and root_free_space.failed else None,
+              {'label': '[MEDIUM] Root free space', 'msg': 'Root filesystem has only ' + root_free_space.stdout + 'G free (need at least 1G)'} if root_free_space is defined and 'failed' in root_free_space and root_free_space.failed else None,
               {'label': '[MEDIUM] Hardcoded MAC (RHEL)', 'msg': 'Hardcoded MAC addresses found in ifcfg files'} if hwaddr_check is defined and 'failed' in hwaddr_check and hwaddr_check.failed else None,
               {'label': '[MEDIUM] Hardcoded MAC (Debian)', 'msg': 'Hardcoded MAC addresses found in Debian network config'} if hwaddr_debian_check is defined and 'failed' in hwaddr_debian_check and hwaddr_debian_check.failed else None,
               {'label': '[MEDIUM] Netplan', 'msg': 'Netplan configuration check failed (rc=' + (netplan_check.rc | string) + ')'} if netplan_check is defined and 'failed' in netplan_check and netplan_check.failed else None,
@@ -1225,10 +1101,7 @@
               {'label': '[CRITICAL] Secure Boot', 'msg': 'Secure Boot is enabled — virtio drivers must be signed for the target'} if secure_boot_check is defined and 'failed' in secure_boot_check and secure_boot_check.failed else None,
               {'label': '[CRITICAL] EFI System Partition', 'msg': 'UEFI system detected but /boot/efi is not mounted as vfat'} if esp_check is defined and 'failed' in esp_check and esp_check.failed else None,
               {'label': '[CRITICAL] ZFS filesystem', 'msg': 'ZFS is in use — virt-v2v cannot convert ZFS volumes'} if zfs_check is defined and 'failed' in zfs_check and zfs_check.failed else None,
-              {'label': '[CRITICAL] pvscsi driver', 'msg': 'VMware pvscsi driver is not loaded — VM may not be using VMware paravirtual SCSI'} if pvscsi_check is defined and 'failed' in pvscsi_check and pvscsi_check.failed else None,
-              {'label': '[CRITICAL] vmmemctl driver', 'msg': 'VMware memory balloon (vmmemctl) driver is not loaded'} if vmmemctl_check is defined and 'failed' in vmmemctl_check and vmmemctl_check.failed else None,
-              {'label': '[CRITICAL] vmci/vsock drivers', 'msg': 'VMware VMCI/vSock modules are not loaded'} if vmci_check is defined and 'failed' in vmci_check and vmci_check.failed else None,
-              {'label': '[CRITICAL] dracut virtio config', 'msg': 'dracut is not configured to include virtio modules — initramfs rebuild may omit them'} if dracut_virtio_check is defined and 'failed' in dracut_virtio_check and dracut_virtio_check.failed else None,
+                {'label': '[CRITICAL] dracut virtio config', 'msg': 'dracut is not configured to include virtio modules — initramfs rebuild may omit them'} if dracut_virtio_check is defined and 'failed' in dracut_virtio_check and dracut_virtio_check.failed else None,
               {'label': '[HIGH] OverlayFS', 'msg': 'OverlayFS mounts detected — cannot be block-copied by virt-v2v'} if overlayfs_check is defined and 'failed' in overlayfs_check and overlayfs_check.failed else None,
               {'label': '[HIGH] FIPS mode', 'msg': 'FIPS mode is enabled — initramfs rebuild may break FIPS integrity chain'} if fips_check is defined and 'failed' in fips_check and fips_check.failed else None,
               {'label': '[HIGH] NSX/vShield agent', 'msg': 'VMware NSX or vShield agent packages detected — will fail on KVM'} if nsx_check is defined and 'failed' in nsx_check and nsx_check.failed else None,

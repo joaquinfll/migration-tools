@@ -1,0 +1,96 @@
+- name: Enable CBT on all compatible disks across VMs
+  hosts: localhost
+  gather_facts: false
+  vars:
+    vm_list:
+      - "my-vm"
+    dc_name: "my-datacenter"
+    snapshot_name: "cbt-activation"
+
+  tasks:
+
+    - name: Get disk info for {{ item }}
+      community.vmware.vmware_guest_disk_info:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: false
+        name: "{{ item }}"
+        datacenter: "{{ dc_name }}"
+      delegate_to: localhost
+      loop: "{{ vm_list }}"
+      register: disk_info_results
+
+    - name: Filter CBT-compatible disks for {{ item.item }}
+      set_fact:
+        compatible_disks: >-
+          {{ item.ansible_facts.guest_disk_info | dict2items | json_query(
+            "[].{
+              prefix: {
+                paravirtual: 'scsi',
+                lsilogic: 'scsi',
+                'lsilogic-sas': 'scsi',
+                sata: 'sata',
+                nvme: 'nvme'
+              }[value.controller_type] | default('scsi'),
+              bus: (value.controller_bus_number | default(0)),
+              unit: value.unit_number,
+              diskmode: value.backing_diskmode | default('persistent')
+            }"
+          ) | selectattr('diskmode', 'match', '^(persistent|dependent_.*)$') | list }}
+      loop: "{{ disk_info_results.results }}"
+      when: item.ansible_facts.guest_disk_info | default([])
+
+    - name: Build CBT advanced settings for {{ item.item }}
+      set_fact:
+        cbt_settings: |
+          - key: ctkEnabled
+            value: "TRUE"
+          {% for disk in compatible_disks %}
+          - key: "{{ disk.prefix }}{{ disk.bus }}:{{ disk.unit }}.ctkEnabled"
+            value: "TRUE"
+          {% endfor %}
+      loop: "{{ disk_info_results.results }}"
+      when: compatible_disks | default([])
+
+    - name: Apply CBT settings to {{ item.item }}
+      community.vmware.vmware_guest:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: false
+        name: "{{ item.item }}"
+        datacenter: "{{ dc_name }}"
+        state: present
+        advanced_settings: "{{ cbt_settings }}"
+      delegate_to: localhost
+      loop: "{{ disk_info_results.results }}"
+      when: cbt_settings | default([])
+
+    - name: Create snapshot to activate CBT on {{ item.item }}
+      community.vmware.vmware_guest_snapshot:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: false
+        name: "{{ item.item }}"
+        datacenter: "{{ dc_name }}"
+        state: present
+        snapshot_name: "{{ snapshot_name }}"
+      delegate_to: localhost
+      loop: "{{ disk_info_results.results }}"
+      when: compatible_disks | default([])
+
+    - name: Remove temporary snapshot from {{ item.item }}
+      community.vmware.vmware_guest_snapshot:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: false
+        name: "{{ item.item }}"
+        datacenter: "{{ dc_name }}"
+        state: absent
+        snapshot_name: "{{ snapshot_name }}"
+      delegate_to: localhost
+      loop: "{{ disk_info_results.results }}"
+      when: compatible_disks | default([])
