@@ -4,6 +4,7 @@
   vars:
     vm_list: []
     snapshot_name: "cbt-activation"
+    vm_folder: "/"
 
   tasks:
 

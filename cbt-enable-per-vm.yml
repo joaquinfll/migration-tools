@@ -31,7 +31,7 @@
          | list }}
   when: _disk_info.guest_disk_info | default({}) | length > 0
 
-- name: Skip {{ vm_name }} — no compatible disks found
+- name: No compatible disks found — skipping {{ vm_name }}
   debug:
     msg: "No CBT-compatible disks found for {{ vm_name }}. Skipping."
   when: compatible_disks | default([]) | length == 0
@@ -62,6 +62,7 @@
         validate_certs: false
         name: "{{ vm_name }}"
         datacenter: "{{ dc_name }}"
+        folder: "{{ vm_folder | default('/') }}"
         state: present
         advanced_settings: "{{ _cbt_settings | from_json }}"
       delegate_to: localhost
@@ -75,6 +76,7 @@
         validate_certs: false
         name: "{{ vm_name }}"
         datacenter: "{{ dc_name }}"
+        folder: "{{ vm_folder | default('/') }}"
         state: present
         snapshot_name: "{{ snapshot_name }}"
       delegate_to: localhost
@@ -99,6 +101,7 @@
         validate_certs: false
         name: "{{ vm_name }}"
         datacenter: "{{ dc_name }}"
+        folder: "{{ vm_folder | default('/') }}"
         state: absent
         snapshot_name: "{{ snapshot_name }}"
       delegate_to: localhost
