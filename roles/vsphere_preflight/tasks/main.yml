@@ -1,0 +1,28 @@
+---
+# vSphere preflight checks — runs on localhost, results stored on target host via delegate_facts
+
+- name: Get vSphere VM info for {{ vsphere_vm_name }}
+  community.vmware.vmware_guest_info:
+    hostname: "{{ vcenter_hostname }}"
+    username: "{{ vcenter_username }}"
+    password: "{{ vcenter_password }}"
+    validate_certs: false
+    name: "{{ vsphere_vm_name }}"
+    datacenter: "{{ dc_name }}"
+  no_log: true
+  register: _vsphere_preflight_vm
+
+- name: Set vSphere failed checks for {{ vsphere_vm_name }}
+  ansible.builtin.set_fact:
+    vsphere_preflight_failed_checks: >-
+      {{
+        [
+          {'label': '[VSphere] [CRITICAL] VM not found', 'msg': 'VM "' + vsphere_vm_name + '" not found in vCenter'} if (_vsphere_preflight_vm is not defined or _vsphere_preflight_vm.instance is not defined or _vsphere_preflight_vm.instance | length == 0) else None,
+          {'label': '[VSphere] [CRITICAL] VMware Tools', 'msg': 'VMware Tools status: ' + (_vsphere_preflight_vm.instance[0].guest.toolsStatus | default('not_installed'))} if (_vsphere_preflight_vm.instance | default([]) | length > 0 and (_vsphere_preflight_vm.instance[0].guest.toolsStatus | default('not_installed') != 'toolsOk')) else None,
+          {'label': '[VSphere] [CRITICAL] Snapshot', 'msg': 'VM has active snapshot(s) — remove before migration'} if (_vsphere_preflight_vm.instance | default([]) | length > 0 and (_vsphere_preflight_vm.instance[0].snapshot | default({}) | length > 0) and (_vsphere_preflight_vm.instance[0].snapshot.snapshotList | default([]) | length > 0)) else None,
+          {'label': '[VSphere] [HIGH] CBT disabled', 'msg': 'Changed Block Tracking is not enabled — required for MTV incremental replication'} if (_vsphere_preflight_vm.instance | default([]) | length > 0 and not (_vsphere_preflight_vm.instance[0].config.changeTrackingEnabled | default(false))) else None,
+          {'label': '[VSphere] [CRITICAL] Independent disk', 'msg': 'VM has independent disk(s) — virt-v2v cannot convert independent disks'} if (_vsphere_preflight_vm.instance | default([]) | length > 0 and (_vsphere_preflight_vm.instance[0].config.hardware.device | default([]) | selectattr('backing.diskMode', 'match', 'independent_') | list | length > 0)) else None,
+          {'label': '[VSphere] [CRITICAL] RDM disk', 'msg': 'VM has RDM disk(s) — virt-v2v cannot convert RDM disks'} if (_vsphere_preflight_vm.instance | default([]) | length > 0 and (_vsphere_preflight_vm.instance[0].config.hardware.device | default([]) | selectattr('backing.compatibilityMode', 'equalto', 'virtualMode') | list | length > 0)) else None,
+          {'label': '[VSphere] [MEDIUM] Legacy NIC', 'msg': 'VM uses e1000/e1000e NIC adapter(s) — will be converted to virtio-net by virt-v2v'} if (_vsphere_preflight_vm.instance | default([]) | length > 0 and (_vsphere_preflight_vm.instance[0].config.hardware.device | default([]) | selectattr('class_id', 'search', 'E1000') | list | length > 0)) else None,
+        ] | reject('equalto', None) | list
+      }}

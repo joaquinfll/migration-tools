@@ -1,0 +1,16 @@
+---
+# Wrapper for vSphere preflight role — captures results per VM in a loop
+# Called by migration-prechecks.yml with loop_var: target_host
+
+- name: Run vSphere preflight for {{ vsphere_vm_name }}
+  ansible.builtin.include_role:
+    name: vsphere_preflight
+
+- name: Store vSphere results for {{ vsphere_vm_name }}
+  ansible.builtin.set_fact:
+    _vsphere_preflight_results: >-
+      {{
+        (_vsphere_preflight_results | default({})) | combine({
+          vsphere_vm_name: vsphere_preflight_failed_checks | default([])
+        })
+      }}

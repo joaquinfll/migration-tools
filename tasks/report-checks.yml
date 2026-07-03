@@ -1,0 +1,18 @@
+---
+# Shared report + fail tasks for all pre-migration playbooks
+# Expects: failed_check_list (set by aggregate-checks.yml)
+
+- name: Report failed migration checks
+  ansible.builtin.debug:
+    msg: "{{ item.label }}: {{ item.msg }}"
+  loop: "{{ failed_check_list }}"
+  loop_control:
+    label: "{{ item.label }}"
+  when: failed_check_list | length > 0
+
+- name: Fail if any migration checks failed
+  ansible.builtin.fail:
+    msg: >-
+      Migration pre-checks failed. {{ failed_check_list | length }} check(s) reported issues above.
+      Please resolve all failures before proceeding with virt-v2v conversion.
+  when: failed_check_list | length > 0

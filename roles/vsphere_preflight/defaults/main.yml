@@ -1,0 +1,5 @@
+---
+# vSphere preflight role defaults
+# Override vsphere_vm_name in inventory if the VM name differs from the short hostname
+vsphere_vm_name: "{{ inventory_hostname | split('.') | first }}"
+# Required: vcenter_hostname, vcenter_username, vcenter_password, dc_name

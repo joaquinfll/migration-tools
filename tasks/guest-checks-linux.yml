@@ -1,0 +1,1051 @@
+---
+- name: Gather Facts
+  ansible.builtin.setup:
+
+- name: Gather Packages
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: Gather Services
+  ansible.builtin.service_facts:
+
+- name: INFO OS
+  ansible.builtin.debug:
+    msg: "{{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}"
+
+- name: Assert preflight requirements
+  ansible.builtin.assert:
+    that:
+      - ansible_version.full is version('2.14', '>=')
+      - ansible_facts['os_family'] in ['RedHat', 'Debian']
+    fail_msg: >-
+      Preflight assertion failed.
+      Ansible >= 2.14 required (found {{ ansible_version.full }}).
+      Supported OS families: RedHat, Debian (found {{ ansible_facts['os_family'] }}).
+    success_msg: >-
+      Preflight OK — Ansible {{ ansible_version.full }},
+      {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}
+
+- name: Check Root Filesystem Is Not BTRFS
+  ansible.builtin.debug:
+    msg: "Root filesystem is {{ root_fstype }}"
+  failed_when: root_fstype == 'btrfs'
+  changed_when: false
+  ignore_errors: true
+  register: check_btrfs_root
+  vars:
+    root_fstype: "{{ ansible_facts['mounts'] | selectattr('mount', 'equalto', '/') | map(attribute='fstype') | first }}"
+  when: root_fstype != ''
+
+- name: Check No BTRFS Filesystems Mounted
+  ansible.builtin.debug:
+    msg: "BTRFS filesystem found at {{ item.mount }}"
+  failed_when: true
+  changed_when: false
+  ignore_errors: true
+  register: check_btrfs_mounts
+  loop: "{{ ansible_facts['mounts'] }}"
+  loop_control:
+    label: "{{ item.mount }} ({{ item.fstype }})"
+  when: item.fstype == 'btrfs'
+
+# Failsafe for any OS: ensure the VM is in vCenter
+- name: Valid Platform
+  ansible.builtin.debug:
+    msg: "Running in {{ ansible_facts['product_name'] }}"
+  ignore_errors: true
+  failed_when: "'VMware' not in ansible_facts['product_name']"
+  changed_when: false
+  register: valid_platform_check
+
+# The package is named the same across distros
+- name: OS VMware Tools
+  ansible.builtin.debug:
+    msg: open-vm-tools is present
+  when: ansible_facts['system'] == "Linux"
+  ignore_errors: true
+  failed_when: "'open-vm-tools' not in ansible_facts['packages']"
+  changed_when: false
+  register: os_vmware_tools_check
+
+# Service unit is named differently per distro:
+#   Debian/Ubuntu → open-vm-tools.service
+#   RHEL/Fedora/SUSE → vmtoolsd.service
+- name: Check open-vm-tools daemon is running
+  ansible.builtin.debug:
+    msg: "open-vm-tools daemon (vmtoolsd) is not running"
+  failed_when: >
+    ('open-vm-tools.service' not in ansible_facts.services
+      or ansible_facts.services['open-vm-tools.service'].state != 'running')
+    and
+    ('vmtoolsd.service' not in ansible_facts.services
+      or ansible_facts.services['vmtoolsd.service'].state != 'running')
+  ignore_errors: true
+  register: vmtools_svc_check
+  when: "'open-vm-tools' in ansible_facts['packages']"
+
+- name: Package ubuntu-minimal Is Present
+  ansible.builtin.debug:
+    msg: ubuntu-minimal is present
+  when: ansible_facts['distribution'] == "Ubuntu"
+  ignore_errors: true
+  failed_when: "'ubuntu-minimal' not in ansible_facts['packages']"
+  changed_when: false
+  register: ubuntu_minimal_check
+
+- name: Find GRUB config files
+  ansible.builtin.find:
+    paths:
+      - /boot/grub
+      - /boot/grub2
+      - /etc
+    patterns:
+      - "grub.cfg"
+      - "default/grub"
+    recurse: false
+  register: grub_files
+
+- name: Check GRUB configs use UUID for root disk
+  ansible.builtin.shell: |
+    grep -lE 'root=/dev/(sd|vd|xvd|disk/|mapper/)' {{ grub_files.files | map(attribute='path') | join(' ') }} 2>/dev/null || true
+  changed_when: false
+  ignore_errors: true
+  register: grub_device_check
+  failed_when: grub_device_check.stdout | length > 0
+  when: grub_files.files | length > 0
+
+# ============ CRITICAL: fstab device paths ============
+# fstab often uses /dev/sd* paths instead of UUIDs — if the underlying disk device
+# changes during migration, the VM won't boot.
+
+- name: Check fstab uses UUIDs for mount points
+  ansible.builtin.shell: |
+    grep -E '^\s*/dev/(sd|vd|xvd)' /etc/fstab 2>/dev/null | grep -vE '^\s*#' || true
+  changed_when: false
+  ignore_errors: true
+  register: fstab_device_check
+  failed_when: fstab_device_check.stdout | length > 0
+  when: "'/etc/fstab' is file"
+
+# ============ CRITICAL: GRUB_CMDLINE_LINUX device paths ============
+# /etc/default/grub may contain root=/dev/sd* in GRUB_CMDLINE_LINUX.
+
+- name: Check GRUB_CMDLINE_LINUX uses UUID
+  ansible.builtin.shell: |
+    grep 'GRUB_CMDLINE_LINUX' /etc/default/grub | grep -E 'root=/dev/(sd|vd|xvd)' || true
+  changed_when: false
+  ignore_errors: true
+  register: grub_cmdline_check
+  failed_when: grub_cmdline_check.stdout | length > 0
+  when: "'/etc/default/grub' is file"
+
+# ============ HIGH: NFS/CIFS mounts in fstab ============
+# Mount points referencing external NFS or CIFS shares will fail if those resources
+# don't exist in the target environment.
+
+- name: Check for NFS/CIFS mounts in fstab
+  ansible.builtin.shell: |
+    grep -E '^\s*\S+\s+\S+\s+(nfs|cifs|smbfs)\s' /etc/fstab 2>/dev/null | grep -vE '^\s*#' || true
+  changed_when: false
+  ignore_errors: true
+  register: nfs_mount_check
+  failed_when: nfs_mount_check.stdout | length > 0
+  when: "'/etc/fstab' is file"
+
+# ============ MEDIUM: Bonding/bridge configs ============
+# Complex network configurations (bonding, bridges, teaming) often break during
+# migration due to MAC address changes.
+
+- name: Check for bonding configurations
+  ansible.builtin.shell: |
+    grep -rE 'mode=|slave' /etc/sysconfig/network-scripts/ 2>/dev/null | grep -vE '^\s*#' || true
+  changed_when: false
+  ignore_errors: true
+  register: bonding_check
+  failed_when: bonding_check.stdout | length > 0
+  when: ansible_facts['os_family'] == "RedHat"
+
+- name: Check for bridge configurations
+  ansible.builtin.shell: |
+    grep -rE 'bridge' /etc/network/interfaces 2>/dev/null | grep -vE '^\s*#' || true
+  changed_when: false
+  ignore_errors: true
+  register: bridge_check
+  failed_when: bridge_check.stdout | length > 0
+  when: ansible_facts['os_family'] == "Debian" and '/etc/network/interfaces' is file
+
+# ============ MEDIUM: Custom udev rules ============
+# Rules referencing specific hardware IDs or MAC addresses break after migration.
+
+- name: Check for hardware-specific udev rules
+  ansible.builtin.shell: |
+    grep -rlE '(SUBSYSTEM=="(block|net)"|KERNEL=="(sd|vd|eth)"|DRIVER=="vmxnet|e1000")' /etc/udev/rules.d/ 2>/dev/null || true
+  changed_when: false
+  ignore_errors: true
+  register: udev_check
+  failed_when: udev_check.stdout | length > 0
+  when: "'/etc/udev/rules.d' is directory"
+
+# ============ LOW: Cron jobs referencing external resources ============
+# Cron jobs referencing external NFS mounts, specific hostnames, or hardware devices.
+
+- name: Check for problematic cron entries
+  ansible.builtin.shell: |
+    crontab -l 2>/dev/null | grep -E '(nfs|cifs|/dev/sd|specific-hostname)' | grep -vE '^\s*#' || true
+  changed_when: false
+  ignore_errors: true
+  register: cron_check
+  failed_when: cron_check.stdout | length > 0
+
+# ============ LOW: Docker host bind mounts ============
+# Bind mounts referencing host-specific paths or devices.
+
+- name: Check for Docker host device mounts
+  ansible.builtin.shell: |
+    docker inspect $(docker ps -q 2>/dev/null) 2>/dev/null | grep -oE '"/dev/[^"]*"' || true
+  changed_when: false
+  ignore_errors: true
+  register: docker_device_check
+  failed_when: docker_device_check.stdout | length > 0
+  when: "'docker' in ansible_facts['packages']"
+
+# ============ LOW: Partition table type (MBR vs GPT) ============
+# MBR is limited to 2TB and may cause issues with large disks.
+
+- name: INFO Partition table type
+  ansible.builtin.shell: |
+    fdisk -l /dev/sda 2>/dev/null | grep 'Disklabel type' || true
+  changed_when: false
+  ignore_errors: true
+  register: partition_table_check
+  when: "'/dev/sda' in ansible_facts['devices']"
+
+# ============ MEDIUM: Network config conflicts ============
+# Running both NetworkManager and legacy ifupdown scripts simultaneously
+# can cause IP conflicts and unpredictable network state.
+
+- name: Check for network config conflicts
+  ansible.builtin.shell: |
+    if systemctl is-active NetworkManager &>/dev/null && \
+       [ -d /etc/sysconfig/network-scripts ] && \
+       ls /etc/sysconfig/network-scripts/ifcfg-* &>/dev/null; then
+      echo "conflict"
+    fi || true
+  changed_when: false
+  ignore_errors: true
+  register: network_conflict_check
+  failed_when: "'conflict' in network_conflict_check.stdout"
+  when: ansible_facts['os_family'] == "RedHat"
+
+# ============ MEDIUM: NTP/chrony configuration ============
+# Large clock drift between source and target can cause certificate and authentication failures.
+
+- name: Check NTP is configured
+  ansible.builtin.debug:
+    msg: "NTP services state: chronyd={{ ansible_facts.services.get('chronyd.service', {}).get('state', 'absent') }}, chrony={{ ansible_facts.services.get('chrony.service', {}).get('state', 'absent') }}, ntpd={{ ansible_facts.services.get('ntpd.service', {}).get('state', 'absent') }}, ntp={{ ansible_facts.services.get('ntp.service', {}).get('state', 'absent') }}"
+  failed_when: >
+    ansible_facts.services.get('chronyd.service', {}).get('state') != 'running' and
+    ansible_facts.services.get('chrony.service', {}).get('state') != 'running' and
+    ansible_facts.services.get('ntpd.service', {}).get('state') != 'running' and
+    ansible_facts.services.get('ntp.service', {}).get('state') != 'running'
+  changed_when: false
+  ignore_errors: true
+  register: ntp_check
+
+# ============ MEDIUM: Non-virtio network drivers ============
+# If the VM is using e1000 or other paravirtualized drivers, virt-v2v should convert them.
+
+- name: INFO Non-virtio network drivers
+  ansible.builtin.shell: |
+    lspci 2>/dev/null | grep -iE 'ethernet|network' | grep -iE 'e1000|vmxnet|igb' || true
+  changed_when: false
+  ignore_errors: true
+  register: nic_driver_check
+
+# ============ MEDIUM: LVM thin provisioning ============
+# Thin provisioning and snapshots can cause issues during conversion.
+
+- name: Check for LVM thin provisioning
+  ansible.builtin.shell: |
+    lvs --noheadings -o lv_attr 2>/dev/null | grep -E 't' || true
+  changed_when: false
+  ignore_errors: true
+  register: lvm_thin_check
+  failed_when: lvm_thin_check.stdout | length > 0
+
+# ============ LOW: Legacy network interface naming ============
+# systemd's predictable naming (enp3s0, ens33) can conflict with VMware tools' device detection.
+
+- name: Check for legacy network interface naming
+  ansible.builtin.shell: |
+    ip -o link show | grep -E '^[0-9]+:\s+eth[0-9]' || true
+  changed_when: false
+  ignore_errors: true
+  register: legacy_nic_check
+  failed_when: legacy_nic_check.stdout | length > 0
+  when: ansible_facts['network']['interfaces'] is defined
+
+# ============ CRITICAL: /proc/cmdline device paths ============
+# The running kernel's cmdline may contain device paths that won't be updated if only grub.cfg is fixed.
+
+- name: Check running kernel cmdline uses UUID
+  ansible.builtin.shell: |
+    cat /proc/cmdline | grep -E 'root=/dev/(sd|vd|xvd)' || true
+  changed_when: false
+  ignore_errors: true
+  register: cmdline_check
+  failed_when: cmdline_check.stdout | length > 0
+
+# ============ CRITICAL: LUKS encrypted volumes ============
+# Encrypted volumes may fail if the passphrase/keyfile isn't available or if the initramfs lacks cryptsetup.
+
+- name: Check for LUKS encrypted volumes
+  ansible.builtin.shell: |
+    lsblk -d -o NAME,FSTYPE 2>/dev/null | grep -i 'luks' || true
+  changed_when: false
+  ignore_errors: true
+  register: luks_check
+  failed_when: luks_check.stdout | length > 0
+
+# ============ CRITICAL: Software RAID arrays ============
+# Software RAID arrays may need rebuild or resync after migration if device names change.
+
+- name: Check for software RAID arrays
+  ansible.builtin.shell: |
+    cat /proc/mdstat | grep -E '^\S+ :\s*active' || true
+  changed_when: false
+  ignore_errors: true
+  register: mdadm_check
+  failed_when: mdadm_check.stdout | length > 0
+
+# ============ CRITICAL: Kernel version compatibility ============
+# virt-v2v has minimum kernel requirements for virtio drivers. Very old kernels may lack them.
+
+- name: Check kernel version is compatible
+  ansible.builtin.debug:
+    msg: "Kernel version: {{ ansible_facts['kernel'] }}"
+  failed_when: >
+    (ansible_facts['kernel'].split('.')[0] | int < 3) or
+    (ansible_facts['kernel'].split('.')[0] | int == 3 and
+     ansible_facts['kernel'].split('.')[1] | int < 10)
+  changed_when: false
+  ignore_errors: true
+  register: kernel_compat
+  when: ansible_facts['kernel'] is defined
+
+# ============ HIGH: Multipath configuration ============
+# Multipath devices with WWID-based naming may break if the underlying disk topology changes.
+
+- name: Check for multipath configuration
+  ansible.builtin.shell: |
+    (multipath -ll 2>/dev/null || true) | grep -E '^[a-z]' || true
+  changed_when: false
+  ignore_errors: true
+  register: multipath_check
+  failed_when: multipath_check.stdout | length > 0
+  when: "'device-mapper-multipath' in ansible_facts['packages']"
+
+# ============ HIGH: GRUB password protection ============
+# If GRUB is password-protected, the VM may not boot if the password isn't preserved.
+
+- name: Check for GRUB password protection
+  ansible.builtin.shell: |
+    grep -E '^\s*password_pbkdf2|^\s*password' /boot/grub/grub.cfg /boot/grub2/grub.cfg 2>/dev/null || true
+  changed_when: false
+  ignore_errors: true
+  register: grub_pass_check
+  failed_when: grub_pass_check.stdout | length > 0
+
+ # ============ MEDIUM: cloud-init datasource configuration ============
+# cloud-init with hypervisor-specific datasource may fail in the target environment.
+
+- name: Check cloud-init datasource configuration
+  ansible.builtin.shell: |
+    grep -E 'datasource_list:\s*(.*NoCloud.*|.*ConfigDrive.*|.*Ec2.*)' /etc/cloud/cloud.cfg 2>/dev/null || true
+  changed_when: false
+  ignore_errors: true
+  register: cloudinit_check
+  failed_when: cloudinit_check.stdout | length > 0
+  when: "'/etc/cloud/cloud.cfg' is file"
+
+# ============ MEDIUM: Hypervisor-specific kernel modules ============
+# Modules loaded for VMware (vmxnet, vmware) or IBM/Accenture FC HBAs (lpfc, qla2xxx)
+# that won't exist or are unnecessary on the KubeVirt target.
+# Note: ixgbe is standard Intel 10GbE on bare-metal servers — not hypervisor-specific.
+
+- name: INFO Hypervisor-specific kernel modules
+  ansible.builtin.shell: |
+    lsmod 2>/dev/null | grep -iE 'vmxnet|vmware|lpfc|qla2xxx|bnx2' || true
+  changed_when: false
+  ignore_errors: true
+  register: hw_module_check
+
+# ============ MEDIUM: Persistent net rules ============
+# Old udev rules that hardcode MAC-to-interface mappings (common in RHEL/CentOS 6).
+
+- name: Check for persistent net rules
+  ansible.builtin.shell: |
+    cat /etc/udev/rules.d/70-persistent-net.rules 2>/dev/null || true
+  changed_when: false
+  ignore_errors: true
+  register: persistent_net_check
+  failed_when: persistent_net_check.stdout | length > 0
+  when: "'/etc/udev/rules.d/70-persistent-net.rules' is file"
+
+# ============ MEDIUM: Hardware-dependent systemd units ============
+# Services with After= or Requires= referencing hardware devices.
+
+- name: Check for hardware-dependent systemd units
+  ansible.builtin.shell: |
+    grep -rl 'After=/dev/\|Requires=/dev/' /etc/systemd/system/ /lib/systemd/system/ 2>/dev/null | grep -vE '\.wants/' || true
+  changed_when: false
+  ignore_errors: true
+  register: systemd_hw_check
+  failed_when: systemd_hw_check.stdout | length > 0
+
+# ============ MEDIUM: VMware Tools kernel module conflicts ============
+# If both open-vm-tools and the proprietary VMware Tools kernel modules are present, they conflict.
+
+- name: INFO VMware Tools kernel module conflicts
+  ansible.builtin.shell: |
+    lsmod 2>/dev/null | grep -E '^vmxnet|^pvscsi|^vmhgfs' || true
+  changed_when: false
+  ignore_errors: true
+  register: vmware_module_check
+  when: "'open-vm-tools' in ansible_facts['packages']"
+
+ # ============ LOW: Swap partition references in fstab ============
+# Swap using /dev/sd* paths will need updating for the new disk device.
+
+- name: Check swap uses UUID in fstab
+  ansible.builtin.shell: |
+    grep -E '^\s*/dev/(sd|vd|xvd)' /etc/fstab | grep -iE 'swap' || true
+  changed_when: false
+  ignore_errors: true
+  register: swap_device_check
+  failed_when: swap_device_check.stdout | length > 0
+  when: "'/etc/fstab' is file"
+
+# ============ LOW: Docker storage driver ============
+# Docker with devicemapper storage driver on top of LVM may not translate well.
+
+- name: Check Docker storage driver
+  ansible.builtin.shell: |
+    docker info 2>/dev/null | awk '/Storage Driver/{print $NF}' || true
+  changed_when: false
+  ignore_errors: true
+  register: docker_driver
+  failed_when: docker_driver.stdout == 'devicemapper'
+  when: "'docker' in ansible_facts['packages']"
+
+# ============ LOW: Syslog forwarding ============
+# Log forwarding to a specific host that won't be reachable after migration.
+
+- name: Check for syslog forwarding
+  ansible.builtin.shell: |
+    grep -E '^@|^\*\*@\*' /etc/rsyslog.conf /etc/syslog.conf 2>/dev/null | grep -vE '^\s*#' || true
+  changed_when: false
+  ignore_errors: true
+  register: syslog_check
+  failed_when: syslog_check.stdout | length > 0
+
+# ============ LOW: Timezone configuration ============
+# Mismatched timezone can cause log correlation and certificate validation issues.
+
+- name: Check timezone is set to UTC
+  ansible.builtin.shell: |
+    timedatectl show --property=Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || true
+  changed_when: false
+  ignore_errors: true
+  register: tz_check
+  failed_when: tz_check.stdout not in ['UTC', 'Etc/UTC']
+
+# ============ LOW: Filesystem resize capability ============
+# Filesystems that can't be resized online may cause issues if disk size changes.
+
+- name: Check root filesystem resize capability
+  ansible.builtin.shell: |
+    df -T / | awk 'NR==2{print $2}'
+  changed_when: false
+  ignore_errors: true
+  register: root_fstype_check
+  failed_when: root_fstype_check.stdout in ['ext3', 'ext2']
+
+# ============ LOW: GRUB video configuration ============
+# Video configuration in GRUB can cause boot issues if the target hypervisor doesn't support the same display.
+
+- name: INFO GRUB video configuration
+  ansible.builtin.shell: |
+    grep -E 'GRUB_GFXMODE|GRUB_GFXPAYLOAD' /etc/default/grub || true
+  changed_when: false
+  ignore_errors: true
+  register: grub_video_check
+
+# ============ LOW: resolv.conf management ============
+# If resolv.conf is a static file instead of a symlink managed by NetworkManager,
+# dhclient, or systemd-resolved, DNS config may not update correctly post-migration.
+
+- name: INFO resolv.conf management
+  ansible.builtin.shell: |
+    readlink -f /etc/resolv.conf 2>/dev/null || ls -la /etc/resolv.conf 2>/dev/null || true
+  changed_when: false
+  ignore_errors: true
+  register: resolv_check
+  when: "'/etc/resolv.conf' is file"
+
+# ============ HIGH: VMware legacy tools ============
+# The legacy VMware Tools daemon (/usr/bin/vmware-toolsd) conflicts with open-vm-tools.
+
+- name: INFO VMware legacy tools daemon
+  ansible.builtin.stat:
+    path: /usr/bin/vmware-toolsd
+  register: vmware_legacy_check
+  changed_when: false
+
+# ============ MEDIUM: Root filesystem free space ============
+# virt-v2v needs at least 1GB free space on root for conversion operations.
+
+- name: Check root filesystem free space
+  ansible.builtin.shell: |
+    df -BG / | awk 'NR==2{gsub("G",""); print $4}'
+  changed_when: false
+  ignore_errors: true
+  register: root_free_space
+  failed_when: root_free_space.stdout | int < 1
+
+# ============ MEDIUM: Hardcoded MAC addresses in ifcfg files ============
+# Hardcoded MAC addresses in network config will break after migration.
+
+- name: Check for hardcoded MAC addresses in ifcfg files
+  ansible.builtin.shell: |
+    grep -rl 'HWADDR=' /etc/sysconfig/network-scripts/ /etc/sysconfig/network/ 2>/dev/null | grep -vE '^\s*#' || true
+  changed_when: false
+  ignore_errors: true
+  register: hwaddr_check
+  failed_when: hwaddr_check.stdout | length > 0
+  when: ansible_facts['os_family'] == "RedHat"
+
+- name: Check for hardcoded MAC addresses in Debian network config
+  ansible.builtin.shell: |
+    grep -rl 'hwaddress\|mac-address' /etc/network/interfaces.d/ /etc/network/ 2>/dev/null | grep -vE '^\s*#' || true
+  changed_when: false
+  ignore_errors: true
+  register: hwaddr_debian_check
+  failed_when: hwaddr_debian_check.stdout | length > 0
+  when: ansible_facts['os_family'] == "Debian"
+
+# ============ MEDIUM: Netplan configuration ============
+# Netplan misconfiguration or a broken state can cause network failure after migration.
+
+- name: Check Netplan configuration is valid
+  ansible.builtin.command:
+    argv:
+      - netplan
+      - info
+  changed_when: false
+  ignore_errors: true
+  register: netplan_check
+  failed_when: netplan_check.rc != 0
+  when: ansible_facts['distribution'] == "Ubuntu"
+
+# ============ HIGH: Immutable files ============
+# Files with the immutable attribute set cannot be modified by virt-v2v or post-migration
+# cleanup scripts, which can block conversion or leave VMware artifacts behind.
+
+- name: Set default value for immutable_files_list
+  ansible.builtin.set_fact:
+    immutable_files_list: "{{ immutable_files_list | default(['/etc/resolv.conf']) }}"
+
+- name: Gather immutable file stats
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ immutable_files_list }}"
+  register: result_immutable_files
+
+- name: Check for immutable files
+  ansible.builtin.debug:
+    msg: "File {{ item.item }} has immutable attribute set"
+  failed_when: item.stat.exists and 'immutable' in (item.stat.attributes | default(''))
+  changed_when: false
+  ignore_errors: true
+  loop: "{{ result_immutable_files.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: result_immutable_files is defined and result_immutable_files.results is defined
+  register: immutable_check
+
+# ============ CRITICAL: UEFI and Secure Boot state ============
+# virt-v2v handles UEFI differently from BIOS. Secure Boot requires signed bootloaders
+# for the target; unsigned virtio drivers will be rejected at boot.
+
+- name: Check if system boots via UEFI
+  ansible.builtin.stat:
+    path: /sys/firmware/efi
+  register: uefi_check
+  changed_when: false
+
+- name: INFO Boot mode
+  ansible.builtin.debug:
+    msg: "Boot mode: {{ 'UEFI' if uefi_check.stat.exists else 'BIOS/Legacy' }}"
+
+- name: Check Secure Boot state
+  ansible.builtin.shell: |
+    mokutil --sb-state 2>/dev/null || echo "mokutil not available"
+  changed_when: false
+  ignore_errors: true
+  register: secure_boot_check
+  failed_when: "'SecureBoot enabled' in secure_boot_check.stdout"
+  when: uefi_check.stat.exists
+
+- name: Check EFI System Partition is mounted and healthy
+  ansible.builtin.shell: |
+    findmnt -n -o FSTYPE /boot/efi 2>/dev/null || true
+  changed_when: false
+  ignore_errors: true
+  register: esp_check
+  failed_when: >
+    uefi_check.stat.exists and
+    (esp_check.stdout | length == 0 or esp_check.stdout.strip() != 'vfat')
+
+# ============ CRITICAL: ZFS filesystems ============
+# virt-v2v has no ZFS support — conversion will fail entirely if ZFS is in use.
+
+- name: Check for ZFS filesystems
+  ansible.builtin.shell: |
+    lsmod 2>/dev/null | grep -E '^zfs' || zpool list 2>/dev/null | grep -v 'no pools' || true
+  changed_when: false
+  ignore_errors: true
+  register: zfs_check
+  failed_when: zfs_check.stdout | length > 0
+
+ # ============ CRITICAL: dracut virtio configuration (RHEL) ============
+# Even if virtio modules exist, dracut must be configured to include them in the
+# initramfs. Without a dracut config entry, initramfs rebuilds will omit them.
+
+- name: Check dracut is configured to include virtio modules
+  ansible.builtin.shell: |
+    grep -rE 'virtio' /etc/dracut.conf /etc/dracut.conf.d/ 2>/dev/null || true
+  changed_when: false
+  ignore_errors: true
+  register: dracut_virtio_check
+  failed_when: dracut_virtio_check.stdout | length == 0
+  when: ansible_facts['os_family'] == "RedHat" and 'dracut' in ansible_facts['packages']
+
+ # ============ HIGH: OverlayFS in use ============
+# OverlayFS (used by Docker/Podman container layers or systemd-volatile-root)
+# cannot be block-copied correctly by virt-v2v.
+
+- name: Check for OverlayFS mounts
+  ansible.builtin.shell: |
+    findmnt -t overlay -n 2>/dev/null || true
+  changed_when: false
+  ignore_errors: true
+  register: overlayfs_check
+  failed_when: overlayfs_check.stdout | length > 0
+
+# ============ HIGH: FIPS mode enabled ============
+# FIPS restricts which crypto algorithms can be used. The initramfs rebuild
+# during virt-v2v conversion may break the FIPS integrity chain.
+
+- name: Check FIPS mode
+  ansible.builtin.shell: |
+    cat /proc/sys/crypto/fips_enabled 2>/dev/null || echo "0"
+  changed_when: false
+  ignore_errors: true
+  register: fips_check
+  failed_when: fips_check.stdout.strip() == "1"
+
+# ============ HIGH: NSX / vShield agent installed ============
+# VMware NSX guest introspection and vShield Endpoint agents are hypervisor-coupled
+# and will fail silently or block network traffic post-migration.
+
+- name: Check for NSX or vShield agent packages
+  ansible.builtin.shell: |
+    (rpm -qa 2>/dev/null || dpkg -l 2>/dev/null) | grep -iE 'nsx|vsep|vshield|vmware-nsx' || true
+  changed_when: false
+  ignore_errors: true
+  register: nsx_check
+  failed_when: nsx_check.stdout | length > 0
+
+# ============ HIGH: VMware Horizon / VDI agent ============
+# VDI agents are VMware-specific and non-functional on KVM.
+
+- name: Check for VMware Horizon or VDI agent packages
+  ansible.builtin.shell: |
+    (rpm -qa 2>/dev/null || dpkg -l 2>/dev/null) | grep -iE 'vmware-view|vmware-horizon|viewagent' || true
+  changed_when: false
+  ignore_errors: true
+  register: horizon_check
+  failed_when: horizon_check.stdout | length > 0
+
+# ============ HIGH: Running databases ============
+# Databases that are not quiesced before disk snapshot result in corrupted data.
+# Confirm a quiesce/backup plan exists before migrating these VMs.
+
+- name: Check for running database services
+  ansible.builtin.debug:
+    msg: "Database service(s) running: {{ db_services_running | join(', ') }}"
+  vars:
+    db_services_running: >-
+      {{
+        (['mysqld.service'] if 'mysqld.service' in ansible_facts.services and ansible_facts.services['mysqld.service'].state == 'running' else []) +
+        (['mariadb.service'] if 'mariadb.service' in ansible_facts.services and ansible_facts.services['mariadb.service'].state == 'running' else []) +
+        (['postgresql.service'] if 'postgresql.service' in ansible_facts.services and ansible_facts.services['postgresql.service'].state == 'running' else []) +
+        (['oracle.service'] if 'oracle.service' in ansible_facts.services and ansible_facts.services['oracle.service'].state == 'running' else []) +
+        (['mongod.service'] if 'mongod.service' in ansible_facts.services and ansible_facts.services['mongod.service'].state == 'running' else [])
+      }}
+  failed_when: db_services_running | length > 0
+  ignore_errors: true
+  register: db_check
+  changed_when: false
+
+# ============ HIGH: qemu-guest-agent available in repos ============
+# Confirms the package can be installed post-migration on OpenShift Virtualization.
+
+- name: Check qemu-guest-agent is available in repos (RHEL)
+  ansible.builtin.shell: |
+    yum info qemu-guest-agent 2>/dev/null | grep -E '^Name' || true
+  changed_when: false
+  ignore_errors: true
+  register: qga_repo_rhel
+  failed_when: qga_repo_rhel.stdout | length == 0
+  when: ansible_facts['os_family'] == "RedHat"
+
+- name: Check qemu-guest-agent is available in repos (Debian)
+  ansible.builtin.shell: |
+    apt-cache show qemu-guest-agent 2>/dev/null | grep -E '^Package' || true
+  changed_when: false
+  ignore_errors: true
+  register: qga_repo_debian
+  failed_when: qga_repo_debian.stdout | length == 0
+  when: ansible_facts['os_family'] == "Debian"
+
+# ============ HIGH: EDR / AV agent detection ============
+# EDR agents with tamper protection (CrowdStrike, SentinelOne, Trend Micro DS, etc.)
+# intercept virt-v2v's driver injection phase via fanotify hooks and can block
+# qemu-guest-agent installation post-migration via process execution rules.
+# Before migrating: add qemu-guest-agent to the EDR allow-list or disable tamper
+# protection for the duration of the conversion and first boot.
+
+- name: Detect EDR or AV packages
+  ansible.builtin.set_fact:
+    edr_pkgs_found: >-
+      {{
+        ansible_facts['packages'].keys() | list | intersect([
+          'falcon-sensor',
+          'cbsensor',
+          'cb-psc-sensor',
+          'sentinelone-agent',
+          'sentinel_agent',
+          'ds_agent',
+          'sophosavp',
+          'savdi',
+          'mcafee-endpoint-security',
+          'cylance',
+          'trellix-agent'
+        ])
+      }}
+
+- name: Check for EDR or AV agent packages
+  ansible.builtin.debug:
+    msg: "EDR/AV packages detected: {{ edr_pkgs_found | join(', ') }}"
+  failed_when: edr_pkgs_found | length > 0
+  changed_when: false
+  ignore_errors: true
+  register: edr_pkg_check
+
+- name: Detect running EDR or AV services
+  ansible.builtin.set_fact:
+    edr_svcs_running: >-
+      {{
+        ansible_facts.services
+        | dict2items
+        | selectattr('key', 'match',
+            '^(falcon-sensor|cbsensor|sentinelone|ds_agent|cylancesvc|sophosavp|trellix)')
+        | selectattr('value.state', 'equalto', 'running')
+        | map(attribute='key')
+        | list
+      }}
+
+- name: Check for EDR or AV agent services
+  ansible.builtin.debug:
+    msg: "EDR/AV services active: {{ edr_svcs_running | join(', ') }}"
+  failed_when: edr_svcs_running | length > 0
+  changed_when: false
+  ignore_errors: true
+  register: edr_svc_check
+
+# ============ MEDIUM: Multiple NICs ============
+# VMs with 2+ NICs require explicit NIC-to-network mapping in the KubeVirt VM spec.
+# Unplanned interfaces will go offline post-migration without manual mapping.
+
+- name: INFO Network interface count
+  ansible.builtin.debug:
+    msg: "NICs (excluding loopback): {{ non_lo_ifaces | length }} — {{ non_lo_ifaces | join(', ') }}"
+  vars:
+    non_lo_ifaces: "{{ ansible_facts['interfaces'] | reject('equalto', 'lo') | list }}"
+
+- name: INFO NIC details
+  ansible.builtin.debug:
+    msg: >-
+      {{ item }}: mac={{ ansible_facts[item]['macaddress'] | default('n/a') }}
+      ip={{ ansible_facts[item].get('ipv4', {}).get('address', 'no-ip') }}
+      driver={{ ansible_facts[item]['module'] | default('unknown') }}
+      mtu={{ ansible_facts[item]['mtu'] | default('n/a') }}
+  loop: "{{ ansible_facts['interfaces'] | reject('equalto', 'lo') | list }}"
+
+- name: Warn if multiple NICs detected
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ non_lo_ifaces | length }} NICs detected —
+      ensure all are mapped to target networks in KubeVirt VM spec
+  vars:
+    non_lo_ifaces: "{{ ansible_facts['interfaces'] | reject('equalto', 'lo') | list }}"
+  when: (ansible_facts['interfaces'] | reject('equalto', 'lo') | list) | length > 1
+  changed_when: false
+
+# ============ MEDIUM: Static IP configuration ============
+# Static IPs require manual network mapping if the target VLAN/subnet differs.
+
+- name: Check for static IP configuration (RHEL)
+  ansible.builtin.shell: |
+    grep -rl 'BOOTPROTO=none\|BOOTPROTO=static' /etc/sysconfig/network-scripts/ 2>/dev/null | grep -v '#' || true
+  changed_when: false
+  ignore_errors: true
+  register: static_ip_rhel
+  when: ansible_facts['os_family'] == "RedHat"
+
+- name: INFO Static IP files found (RHEL)
+  ansible.builtin.debug:
+    msg: "Static IP config files: {{ static_ip_rhel.stdout_lines }}"
+  when: ansible_facts['os_family'] == "RedHat" and static_ip_rhel.stdout | length > 0
+
+- name: Check for static IP configuration (Debian/Netplan)
+  ansible.builtin.shell: |
+    grep -rl 'addresses:' /etc/netplan/ 2>/dev/null || grep -rl 'address' /etc/network/interfaces 2>/dev/null || true
+  changed_when: false
+  ignore_errors: true
+  register: static_ip_debian
+  when: ansible_facts['os_family'] == "Debian"
+
+- name: INFO Static IP files found (Debian)
+  ansible.builtin.debug:
+    msg: "Static IP config files: {{ static_ip_debian.stdout_lines }}"
+  when: ansible_facts['os_family'] == "Debian" and static_ip_debian.stdout | length > 0
+
+# ============ MEDIUM: Huge pages configured ============
+# Huge page reservations are topology-dependent; if the KVM host NUMA topology
+# differs, the reservation may fail at boot and starve the applications that need them.
+
+- name: Check for huge pages configuration
+  ansible.builtin.shell: |
+    grep -E 'HugePages_Total' /proc/meminfo 2>/dev/null | awk '{print $2}'
+  changed_when: false
+  ignore_errors: true
+  register: hugepages_check
+  failed_when: hugepages_check.stdout.strip() | int > 0
+
+- name: INFO Huge pages total
+  ansible.builtin.debug:
+    msg: "HugePages_Total: {{ hugepages_check.stdout.strip() }}"
+  when: hugepages_check.stdout.strip() | int > 0
+
+# ============ MEDIUM: AppArmor profiles referencing hardware paths ============
+# AppArmor profiles may deny access to virtio device paths (/dev/vda, /dev/virtio-ports/)
+# that didn't exist on VMware, causing silent permission failures post-migration.
+
+- name: Check AppArmor profiles for /dev/sd* references
+  ansible.builtin.shell: |
+    grep -rl '/dev/sd' /etc/apparmor.d/ 2>/dev/null || true
+  changed_when: false
+  ignore_errors: true
+  register: apparmor_check
+  failed_when: apparmor_check.stdout | length > 0
+  when: "'/etc/apparmor.d' is directory"
+
+# ============ MEDIUM: auditd rules referencing block devices ============
+# Audit rules like -w /dev/sda will silently fail or flood logs when the device
+# is renamed to /dev/vda after migration.
+
+- name: Check auditd rules for /dev/sd* references
+  ansible.builtin.shell: |
+    auditctl -l 2>/dev/null | grep '/dev/sd' || grep -r '/dev/sd' /etc/audit/rules.d/ 2>/dev/null || true
+  changed_when: false
+  ignore_errors: true
+  register: auditd_check
+  failed_when: auditd_check.stdout | length > 0
+  when: "'audit' in ansible_facts['packages'] or 'auditd' in ansible_facts['packages']"
+
+# ============ MEDIUM: Real-time kernel ============
+# RT kernels have stricter driver compatibility; virtio drivers may cause latency
+# spikes or fail to load with CONFIG_PREEMPT_RT builds.
+
+- name: Check for real-time kernel
+  ansible.builtin.shell: |
+    echo "{{ ansible_facts['kernel'] }}" | grep -iE '\+rt|-rt' || true
+  changed_when: false
+  ignore_errors: true
+  register: rt_kernel_check
+  failed_when: rt_kernel_check.stdout | length > 0
+  when: ansible_facts['kernel'] is defined
+
+# ============ MEDIUM: Third-party backup agents ============
+# VMware-integrated backup agents (Veeam, Commvault, NetBackup) use vSphere APIs
+# for snapshot quiescing. They stop working and may hold file locks during migration.
+
+- name: Check for VMware-integrated backup agent packages
+  ansible.builtin.shell: |
+    (rpm -qa 2>/dev/null || dpkg -l 2>/dev/null) | grep -iE 'veeam|commvault|netbackup|nbu|clmagent|bkupexec' || true
+  changed_when: false
+  ignore_errors: true
+  register: backup_agent_check
+  failed_when: backup_agent_check.stdout | length > 0
+
+# ============ MEDIUM: SR-IOV or PCI passthrough in use ============
+# VMs using SR-IOV or PCI passthrough cannot live-migrate on KubeVirt without
+# specific device plugin configuration; plain passthrough VMs are not portable.
+
+- name: Check for SR-IOV or PCI passthrough devices
+  ansible.builtin.shell: |
+    lspci 2>/dev/null | grep -iE 'virtual function|SR-IOV' || ls /sys/bus/pci/drivers/vfio-pci/ 2>/dev/null || true
+  changed_when: false
+  ignore_errors: true
+  register: sriov_check
+  failed_when: sriov_check.stdout | length > 0
+
+# ============ LOW: Podman/Docker containers running ============
+# Live containers should be stopped before migration for filesystem consistency.
+
+- name: Check for running Podman containers
+  ansible.builtin.shell: |
+    podman ps -q 2>/dev/null | wc -l || echo "0"
+  changed_when: false
+  ignore_errors: true
+  register: podman_running_check
+  failed_when: podman_running_check.stdout.strip() | int > 0
+  when: "'podman' in ansible_facts['packages']"
+
+- name: Check for running Docker containers
+  ansible.builtin.shell: |
+    docker ps -q 2>/dev/null | wc -l || echo "0"
+  changed_when: false
+  ignore_errors: true
+  register: docker_running_check
+  failed_when: docker_running_check.stdout.strip() | int > 0
+  when: "'docker' in ansible_facts['packages'] or 'docker-ce' in ansible_facts['packages']"
+
+# ============ LOW: virt-who / subscription tied to VMware UUID ============
+# RHEL subscriptions registered with virt-who in VMware mode need re-registration
+# after migration since the hypervisor UUID changes.
+
+- name: Check for virt-who VMware configuration
+  ansible.builtin.shell: |
+    grep -rl 'vmware\|vsphere' /etc/virt-who.d/ 2>/dev/null || true
+  changed_when: false
+  ignore_errors: true
+  register: virtwho_check
+  failed_when: virtwho_check.stdout | length > 0
+  when: "'/etc/virt-who.d' is directory"
+
+# ============ LOW: OVN-Kubernetes MTU compatibility ============
+# If the VM has a custom MTU (e.g., 9000 for jumbo frames), it may cause
+# packet fragmentation on OVN's overlay network (default MTU 1400).
+
+- name: Check for non-standard MTU configuration
+  ansible.builtin.shell: |
+    ip -o link show | awk '{for(i=1;i<=NF;i++) if ($i=="mtu") print $(i+1)}' | grep -vE '^(1500|65536)$' || true
+  changed_when: false
+  ignore_errors: true
+  register: mtu_check
+  failed_when: mtu_check.stdout | length > 0
+
+- name: INFO MTU values
+  ansible.builtin.debug:
+    msg: "Non-standard MTU values detected: {{ mtu_check.stdout_lines }}"
+  when: mtu_check.stdout | length > 0
+
+# ============ LOW: cloud-init VMwareGuestInfo datasource ============
+# OpenShift Virtualization injects config via VMwareGuestInfo datasource.
+# Without it configured, cloud-init won't configure networking on first boot.
+
+- name: Check cloud-init VMwareGuestInfo datasource is configured
+  ansible.builtin.shell: |
+    grep -E 'VMwareGuestInfo' /etc/cloud/cloud.cfg /etc/cloud/cloud.cfg.d/*.cfg 2>/dev/null || true
+  changed_when: false
+  ignore_errors: true
+  register: cloudinit_vmware_guestinfo_check
+  failed_when: >
+    'cloud-init' in ansible_facts['packages'] and
+    cloudinit_vmware_guestinfo_check.stdout | length == 0
+
+# ============ AGGREGATION: Report all failures at the end ============
+
+- name: Set guest failed checks (Linux)
+  ansible.builtin.set_fact:
+    guest_failed_checks: >-
+      {{
+        [
+          {'label': '[CRITICAL] Valid Platform', 'msg': 'VM is not running on VMware vSphere'} if valid_platform_check is defined and 'failed' in valid_platform_check and valid_platform_check.failed else None,
+          {'label': '[CRITICAL] open-vm-tools package', 'msg': 'open-vm-tools is not installed'} if os_vmware_tools_check is defined and 'failed' in os_vmware_tools_check and os_vmware_tools_check.failed else None,
+          {'label': '[HIGH] ubuntu-minimal package', 'msg': 'ubuntu-minimal package is not installed'} if ubuntu_minimal_check is defined and 'failed' in ubuntu_minimal_check and ubuntu_minimal_check.failed else None,
+          {'label': '[CRITICAL] BTRFS root', 'msg': 'Root filesystem is btrfs'} if check_btrfs_root is defined and 'failed' in check_btrfs_root and check_btrfs_root.failed else None,
+          {'label': '[CRITICAL] BTRFS mounts', 'msg': 'BTRFS filesystem detected on mounted volumes'} if check_btrfs_mounts is defined and 'failed' in check_btrfs_mounts and check_btrfs_mounts.failed else None,
+          {'label': '[CRITICAL] GRUB UUIDs', 'msg': 'Device path references found in grub.cfg'} if grub_device_check is defined and 'failed' in grub_device_check and grub_device_check.failed else None,
+          {'label': '[CRITICAL] fstab UUIDs', 'msg': 'Device path references found in /etc/fstab'} if fstab_device_check is defined and 'failed' in fstab_device_check and fstab_device_check.failed else None,
+        {'label': '[CRITICAL] GRUB_CMDLINE_LINUX', 'msg': 'Device path references found in GRUB_CMDLINE_LINUX'} if grub_cmdline_check is defined and 'failed' in grub_cmdline_check and grub_cmdline_check.failed else None,
+          {'label': '[HIGH] NFS/CIFS mounts', 'msg': 'NFS/CIFS mounts found in /etc/fstab'} if nfs_mount_check is defined and 'failed' in nfs_mount_check and nfs_mount_check.failed else None,
+          {'label': '[MEDIUM] Bonding configs', 'msg': 'Bonding configuration detected'} if bonding_check is defined and 'failed' in bonding_check and bonding_check.failed else None,
+          {'label': '[MEDIUM] Bridge configs', 'msg': 'Bridge configuration detected'} if bridge_check is defined and 'failed' in bridge_check and bridge_check.failed else None,
+          {'label': '[MEDIUM] udev rules', 'msg': 'Hardware-specific udev rules found'} if udev_check is defined and 'failed' in udev_check and udev_check.failed else None,
+          {'label': '[LOW] Cron entries', 'msg': 'Problematic cron entries found'} if cron_check is defined and 'failed' in cron_check and cron_check.failed else None,
+          {'label': '[LOW] Docker mounts', 'msg': 'Docker host device bind mounts found'} if docker_device_check is defined and 'failed' in docker_device_check and docker_device_check.failed else None,
+          {'label': '[MEDIUM] Network conflicts', 'msg': 'NetworkManager and ifupdown both active'} if network_conflict_check is defined and 'failed' in network_conflict_check and network_conflict_check.failed else None,
+          {'label': '[MEDIUM] NTP config', 'msg': 'No NTP/chrony service detected'} if ntp_check is defined and 'failed' in ntp_check and ntp_check.failed else None,
+          {'label': '[MEDIUM] LVM thin', 'msg': 'LVM thin provisioning detected'} if lvm_thin_check is defined and 'failed' in lvm_thin_check and lvm_thin_check.failed else None,
+          {'label': '[LOW] Legacy NIC naming', 'msg': 'Legacy ethX network interface naming detected'} if legacy_nic_check is defined and 'failed' in legacy_nic_check and legacy_nic_check.failed else None,
+          {'label': '[CRITICAL] cmdline', 'msg': 'Device path references found in /proc/cmdline'} if cmdline_check is defined and 'failed' in cmdline_check and cmdline_check.failed else None,
+          {'label': '[CRITICAL] LUKS encryption', 'msg': 'LUKS encrypted volumes detected'} if luks_check is defined and 'failed' in luks_check and luks_check.failed else None,
+          {'label': '[CRITICAL] Software RAID', 'msg': 'Software RAID arrays detected'} if mdadm_check is defined and 'failed' in mdadm_check and mdadm_check.failed else None,
+          {'label': '[CRITICAL] Kernel version', 'msg': 'Kernel version too old for virtio drivers'} if kernel_compat is defined and 'failed' in kernel_compat and kernel_compat.failed else None,
+          {'label': '[HIGH] Multipath', 'msg': 'Multipath configuration detected'} if multipath_check is defined and 'failed' in multipath_check and multipath_check.failed else None,
+          {'label': '[HIGH] GRUB password', 'msg': 'GRUB password protection detected'} if grub_pass_check is defined and 'failed' in grub_pass_check and grub_pass_check.failed else None,
+            {'label': '[MEDIUM] cloud-init', 'msg': 'Hypervisor-specific cloud-init datasource detected'} if cloudinit_check is defined and 'failed' in cloudinit_check and cloudinit_check.failed else None,
+          {'label': '[MEDIUM] Persistent net rules', 'msg': 'Persistent net rules found (MAC-to-interface binding)'} if persistent_net_check is defined and 'failed' in persistent_net_check and persistent_net_check.failed else None,
+       {'label': '[MEDIUM] Systemd units', 'msg': 'Hardware-dependent systemd units detected'} if systemd_hw_check is defined and 'failed' in systemd_hw_check and systemd_hw_check.failed else None,
+          {'label': '[LOW] Swap UUIDs', 'msg': 'Swap using device path in /etc/fstab'} if swap_device_check is defined and 'failed' in swap_device_check and swap_device_check.failed else None,
+          {'label': '[LOW] Docker driver', 'msg': 'Docker using devicemapper storage driver'} if docker_driver is defined and 'failed' in docker_driver and docker_driver.failed else None,
+          {'label': '[LOW] Syslog forwarding', 'msg': 'Syslog forwarding to external host detected'} if syslog_check is defined and 'failed' in syslog_check and syslog_check.failed else None,
+          {'label': '[LOW] Timezone', 'msg': 'Timezone is not UTC: ' + tz_check.stdout} if tz_check is defined and 'failed' in tz_check and tz_check.failed else None,
+          {'label': '[LOW] FS resize', 'msg': 'Root filesystem is ' + root_fstype_check.stdout + ' (may not support online resize)'} if root_fstype_check is defined and 'failed' in root_fstype_check and root_fstype_check.failed else None,
+          {'label': '[MEDIUM] Root free space', 'msg': 'Root filesystem has only ' + root_free_space.stdout + 'G free (need at least 1G)'} if root_free_space is defined and 'failed' in root_free_space and root_free_space.failed else None,
+          {'label': '[MEDIUM] Hardcoded MAC (RHEL)', 'msg': 'Hardcoded MAC addresses found in ifcfg files'} if hwaddr_check is defined and 'failed' in hwaddr_check and hwaddr_check.failed else None,
+          {'label': '[MEDIUM] Hardcoded MAC (Debian)', 'msg': 'Hardcoded MAC addresses found in Debian network config'} if hwaddr_debian_check is defined and 'failed' in hwaddr_debian_check and hwaddr_debian_check.failed else None,
+          {'label': '[MEDIUM] Netplan', 'msg': 'Netplan configuration check failed (rc=' + (netplan_check.rc | string) + ')'} if netplan_check is defined and 'failed' in netplan_check and netplan_check.failed else None,
+          {'label': '[HIGH] Immutable files', 'msg': 'One or more files in immutable_files_list have the immutable attribute set'} if immutable_check is defined and 'failed' in immutable_check and immutable_check.failed else None,
+          {'label': '[CRITICAL] open-vm-tools service', 'msg': 'open-vm-tools daemon (vmtoolsd) is not in running state'} if vmtools_svc_check is defined and 'failed' in vmtools_svc_check and vmtools_svc_check.failed else None,
+          {'label': '[CRITICAL] Secure Boot', 'msg': 'Secure Boot is enabled — virtio drivers must be signed for the target'} if secure_boot_check is defined and 'failed' in secure_boot_check and secure_boot_check.failed else None,
+          {'label': '[CRITICAL] EFI System Partition', 'msg': 'UEFI system detected but /boot/efi is not mounted as vfat'} if esp_check is defined and 'failed' in esp_check and esp_check.failed else None,
+          {'label': '[CRITICAL] ZFS filesystem', 'msg': 'ZFS is in use — virt-v2v cannot convert ZFS volumes'} if zfs_check is defined and 'failed' in zfs_check and zfs_check.failed else None,
+            {'label': '[CRITICAL] dracut virtio config', 'msg': 'dracut is not configured to include virtio modules — initramfs rebuild may omit them'} if dracut_virtio_check is defined and 'failed' in dracut_virtio_check and dracut_virtio_check.failed else None,
+          {'label': '[HIGH] OverlayFS', 'msg': 'OverlayFS mounts detected — cannot be block-copied by virt-v2v'} if overlayfs_check is defined and 'failed' in overlayfs_check and overlayfs_check.failed else None,
+          {'label': '[HIGH] FIPS mode', 'msg': 'FIPS mode is enabled — initramfs rebuild may break FIPS integrity chain'} if fips_check is defined and 'failed' in fips_check and fips_check.failed else None,
+          {'label': '[HIGH] NSX/vShield agent', 'msg': 'VMware NSX or vShield agent packages detected — will fail on KVM'} if nsx_check is defined and 'failed' in nsx_check and nsx_check.failed else None,
+          {'label': '[HIGH] Horizon/VDI agent', 'msg': 'VMware Horizon or VDI agent detected — non-functional on KVM'} if horizon_check is defined and 'failed' in horizon_check and horizon_check.failed else None,
+          {'label': '[HIGH] Running databases', 'msg': 'Database services are running without a quiesce plan'} if db_check is defined and 'failed' in db_check and db_check.failed else None,
+          {'label': '[HIGH] qemu-guest-agent (RHEL repo)', 'msg': 'qemu-guest-agent not available in configured repositories'} if qga_repo_rhel is defined and 'failed' in qga_repo_rhel and qga_repo_rhel.failed else None,
+          {'label': '[HIGH] qemu-guest-agent (Debian repo)', 'msg': 'qemu-guest-agent not available in configured repositories'} if qga_repo_debian is defined and 'failed' in qga_repo_debian and qga_repo_debian.failed else None,
+          {'label': '[HIGH] EDR/AV package', 'msg': 'EDR/AV package detected — may block virt-v2v conversion and qemu-guest-agent install post-migration. Add qemu-guest-agent to EDR allow-list before migrating: ' + (edr_pkgs_found | join(', '))} if edr_pkg_check is defined and 'failed' in edr_pkg_check and edr_pkg_check.failed else None,
+          {'label': '[HIGH] EDR/AV service', 'msg': 'EDR/AV service running — may block virt-v2v conversion and qemu-guest-agent install post-migration. Add qemu-guest-agent to EDR allow-list before migrating: ' + (edr_svcs_running | join(', '))} if edr_svc_check is defined and 'failed' in edr_svc_check and edr_svc_check.failed else None,
+          {'label': '[MEDIUM] Huge pages', 'msg': 'Huge pages are configured — NUMA topology may differ on KVM host'} if hugepages_check is defined and 'failed' in hugepages_check and hugepages_check.failed else None,
+          {'label': '[MEDIUM] AppArmor /dev/sd* refs', 'msg': 'AppArmor profiles reference /dev/sd* — may deny /dev/vd* access post-migration'} if apparmor_check is defined and 'failed' in apparmor_check and apparmor_check.failed else None,
+          {'label': '[MEDIUM] auditd /dev/sd* rules', 'msg': 'auditd rules reference /dev/sd* — will fail silently after device rename'} if auditd_check is defined and 'failed' in auditd_check and auditd_check.failed else None,
+          {'label': '[MEDIUM] Real-time kernel', 'msg': 'RT kernel detected — virtio driver compatibility may be affected'} if rt_kernel_check is defined and 'failed' in rt_kernel_check and rt_kernel_check.failed else None,
+          {'label': '[MEDIUM] Backup agents', 'msg': 'VMware-integrated backup agent detected — will lose vSphere integration'} if backup_agent_check is defined and 'failed' in backup_agent_check and backup_agent_check.failed else None,
+          {'label': '[MEDIUM] SR-IOV/passthrough', 'msg': 'SR-IOV or PCI passthrough devices detected — not portable without KubeVirt device plugin'} if sriov_check is defined and 'failed' in sriov_check and sriov_check.failed else None,
+          {'label': '[LOW] Podman containers running', 'msg': 'Podman containers are running — stop before migration for filesystem consistency'} if podman_running_check is defined and 'failed' in podman_running_check and podman_running_check.failed else None,
+          {'label': '[LOW] Docker containers running', 'msg': 'Docker containers are running — stop before migration for filesystem consistency'} if docker_running_check is defined and 'failed' in docker_running_check and docker_running_check.failed else None,
+          {'label': '[LOW] virt-who VMware config', 'msg': 'virt-who VMware config detected — RHEL subscription needs re-registration after migration'} if virtwho_check is defined and 'failed' in virtwho_check and virtwho_check.failed else None,
+          {'label': '[LOW] Non-standard MTU', 'msg': 'Non-standard MTU detected — may cause fragmentation on OVN overlay network (default MTU 1400)'} if mtu_check is defined and 'failed' in mtu_check and mtu_check.failed else None,
+          {'label': '[LOW] cloud-init VMwareGuestInfo', 'msg': 'cloud-init VMwareGuestInfo datasource not configured — network may not initialize on first boot in OpenShift Virtualization'} if cloudinit_vmware_guestinfo_check is defined and 'failed' in cloudinit_vmware_guestinfo_check and cloudinit_vmware_guestinfo_check.failed else None
+        ] | reject('equalto', None) | list
+      }}

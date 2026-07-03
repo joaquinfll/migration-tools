@@ -1,0 +1,6 @@
+---
+- name: Fail — unsupported OS family
+  ansible.builtin.fail:
+    msg: >-
+      Unsupported OS family: {{ ansible_facts['os_family'] | default('unknown') }}.
+      Supported: RedHat, Debian, Windows.

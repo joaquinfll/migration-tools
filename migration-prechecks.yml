@@ -1,0 +1,64 @@
+---
+# Consolidated migration pre-checks: vSphere + guest OS
+# Runs vSphere checks (on localhost) then dispatches to OS-specific guest checks.
+# Requires: vcenter_hostname, vcenter_username, vcenter_password, dc_name
+#
+# Usage:
+#   ansible-playbook -i inventory migration-prechecks.yml
+#
+# Per-VM vCenter name override (if VM name differs from short hostname):
+#   inventory:
+#     all:
+#       hosts:
+#         web-01.example.com:
+#           vsphere_vm_name: "prod-web-01"
+
+# Play 1: vSphere checks per VM (runs on localhost)
+- name: VSphere pre-flight validation
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Check each VM in vCenter
+      ansible.builtin.include_tasks: roles/vsphere_preflight/tasks/run-per-vm.yml
+      loop: "{{ groups['all'] }}"
+      loop_control:
+        loop_var: target_host
+        label: "{{ hostvars[target_host]['vsphere_vm_name'] | default(target_host | split('.') | first) }}"
+      vars:
+        vsphere_vm_name: "{{ hostvars[target_host]['vsphere_vm_name'] | default(target_host | split('.') | first) }}"
+      when: vcenter_hostname is defined
+      ignore_errors: true
+
+# Play 2: Guest checks with conditional dispatch
+- name: Guest pre-migration checks
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Assign vSphere results to this host
+      ansible.builtin.set_fact:
+        vsphere_preflight_failed_checks: >-
+          {{ hostvars['localhost']['_vsphere_preflight_results'][inventory_hostname] | default([]) }}
+      when: vcenter_hostname is defined and hostvars['localhost']['_vsphere_preflight_results'] is defined
+
+    - name: Detect guest OS family
+      ansible.builtin.setup:
+        gather_subset: min
+      changed_when: false
+
+    - name: Run Linux guest checks
+      ansible.builtin.include_tasks: tasks/guest-checks-linux.yml
+      when: ansible_facts['os_family'] in ['RedHat', 'Debian']
+
+    - name: Run Windows guest checks
+      ansible.builtin.include_tasks: tasks/guest-checks-windows.yml
+      when: ansible_facts['os_family'] == 'Windows'
+
+    - name: Fail on unsupported OS
+      ansible.builtin.include_tasks: tasks/guest-checks-unsupported.yml
+      when: ansible_facts['os_family'] not in ['RedHat', 'Debian', 'Windows']
+
+    - name: Aggregate results
+      ansible.builtin.include_tasks: tasks/aggregate-checks.yml
+
+    - name: Report results
+      ansible.builtin.include_tasks: tasks/report-checks.yml

@@ -1,0 +1,10 @@
+---
+# Merges vSphere + guest failures into failed_check_list
+# Expects: guest_failed_checks (set by caller), vsphere_preflight_failed_checks (from role, optional)
+- name: Build failed check list
+  ansible.builtin.set_fact:
+    failed_check_list: >-
+      {{
+        (vsphere_preflight_failed_checks | default([])) +
+        (guest_failed_checks | default([]))
+      }}

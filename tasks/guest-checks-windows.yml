@@ -1,0 +1,520 @@
+---
+- name: Gather Facts
+  ansible.builtin.setup:
+
+- name: Gather Services
+  ansible.builtin.service_facts:
+
+- name: INFO OS
+  ansible.builtin.debug:
+    msg: "{{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}"
+
+- name: Assert preflight requirements
+  ansible.builtin.assert:
+    that:
+      - ansible_version.full is version('2.14', '>=')
+      - ansible_facts['os_family'] == 'Windows'
+    fail_msg: >-
+      Preflight assertion failed.
+      Ansible >= 2.14 required (found {{ ansible_version.full }}).
+      OS family must be Windows (found {{ ansible_facts['os_family'] }}).
+    success_msg: >-
+      Preflight OK — Ansible {{ ansible_version.full }},
+      {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}
+
+# ============ CRITICAL: BitLocker encryption ============
+# virt-v2v cannot read encrypted volumes — hard blocker for conversion.
+
+- name: Check BitLocker is not enabled
+  ansible.windows.win_shell: |
+    $vols = Get-BitLockerVolume -ErrorAction SilentlyContinue |
+      Where-Object { $_.VolumeStatus -ne 'FullyDecrypted' }
+    if ($vols) { ($vols.MountPoint) -join ', ' } else { "" }
+  changed_when: false
+  ignore_errors: true
+  register: bitlocker_check
+  failed_when: bitlocker_check.stdout | trim | length > 0
+
+# ============ CRITICAL: Dynamic disks ============
+# virt-v2v only handles Basic disk layout — Dynamic disks (spanned, striped,
+# mirrored) cannot be converted.
+
+- name: Check no Dynamic disks are present
+  ansible.windows.win_shell: |
+    $disks = Get-Disk | Where-Object { $_.PartitionStyle -eq 'Dynamic' }
+    if ($disks) { "Disk(s): " + (($disks.Number | ForEach-Object { $_.ToString() }) -join ', ') } else { "" }
+  changed_when: false
+  ignore_errors: true
+  register: dynamic_disk_check
+  failed_when: dynamic_disk_check.stdout | trim | length > 0
+
+# ============ CRITICAL: ReFS volumes ============
+# virt-v2v has no ReFS support — conversion will fail if ReFS is present.
+
+- name: Check no ReFS volumes are present
+  ansible.windows.win_shell: |
+    $vols = Get-Volume | Where-Object { $_.FileSystem -eq 'ReFS' }
+    if ($vols) { ($vols.DriveLetter | Where-Object { $_ }) -join ', ' } else { "" }
+  changed_when: false
+  ignore_errors: true
+  register: refs_check
+  failed_when: refs_check.stdout | trim | length > 0
+
+# ============ CRITICAL: Windows version compatibility ============
+# virt-v2v supports Windows 7 / Server 2008 R2 (NT 6.1) and newer.
+
+- name: Check Windows version is compatible with virt-v2v
+  ansible.builtin.debug:
+    msg: "Windows version: {{ ansible_facts['distribution_version'] }}"
+  failed_when: ansible_facts['distribution_version'] is version('6.1', '<')
+  changed_when: false
+  ignore_errors: true
+  register: win_version_check
+
+# ============ CRITICAL: Secure Boot ============
+# Virtio drivers must be signed; unsigned drivers will be rejected at boot
+# on a UEFI + Secure Boot system.
+
+- name: Check Secure Boot state
+  ansible.windows.win_shell: |
+    try {
+      $sb = Confirm-SecureBootUEFI -ErrorAction Stop
+      if ($sb) { "enabled" } else { "disabled" }
+    } catch { "unavailable" }
+  changed_when: false
+  ignore_errors: true
+  register: secure_boot_win_check
+  failed_when: secure_boot_win_check.stdout | trim == 'enabled'
+
+# ============ CRITICAL: Pending reboot ============
+# Converting a VM with a pending reboot produces an inconsistent disk state.
+
+- name: Check no pending reboot
+  ansible.windows.win_shell: |
+    $reboot = $false
+    $keys = @(
+      'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired',
+      'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+      'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\PendingFileRenameOperations'
+    )
+    foreach ($key in $keys) { if (Test-Path $key) { $reboot = $true } }
+    if ($reboot) { "reboot pending" } else { "" }
+  changed_when: false
+  ignore_errors: true
+  register: pending_reboot_check
+  failed_when: pending_reboot_check.stdout | trim | length > 0
+
+# ============ CRITICAL: BCD store integrity ============
+# A corrupt BCD store causes an immediate boot failure after conversion.
+
+- name: Check BCD store integrity
+  ansible.windows.win_shell: |
+    $result = bcdedit /enum all 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { "BCD error: $result" } else { "" }
+  changed_when: false
+  ignore_errors: true
+  register: bcd_check
+  failed_when: bcd_check.stdout | trim | length > 0
+
+# ============ HIGH: VMware Tools installed ============
+# virt-v2v removes VMware Tools automatically during conversion.
+# If Tools is absent or broken, virt-v2v cannot perform a clean handoff.
+
+- name: Check VMware Tools is installed
+  ansible.windows.win_shell: |
+    $svc = Get-Service -Name 'VMTools' -ErrorAction SilentlyContinue
+    if ($svc) { "installed" } else { "" }
+  changed_when: false
+  ignore_errors: true
+  register: vmtools_installed_check
+  failed_when: vmtools_installed_check.stdout | trim | length == 0
+
+- name: Check VMware Tools service is running
+  ansible.builtin.debug:
+    msg: "VMTools state: {{ ansible_facts.services.get('VMTools', {}).get('state', 'absent') }}"
+  failed_when: ansible_facts.services.get('VMTools', {}).get('state') != 'running'
+  changed_when: false
+  ignore_errors: true
+  register: vmtools_svc_check
+
+- name: INFO VMware drivers detected
+  ansible.windows.win_shell: |
+    $drv = Get-WmiObject Win32_PnPSignedDriver -ErrorAction SilentlyContinue |
+      Where-Object { $_.DeviceName -match 'VMware' }
+    if ($drv) { ($drv.DeviceName | Select-Object -Unique) -join ', ' } else { "none" }
+  changed_when: false
+  ignore_errors: true
+  register: vmware_drivers_check
+
+- name: INFO VMware driver inventory
+  ansible.builtin.debug:
+    msg: "VMware drivers present: {{ vmware_drivers_check.stdout | trim }}"
+
+# ============ HIGH: Windows activation type ============
+# KMS activation is tied to the hypervisor UUID. After migration the UUID
+# changes, causing KMS to de-activate within 30 days.
+
+- name: Check Windows activation type
+  ansible.windows.win_shell: |
+    $result = cscript //NoLogo "$env:SystemRoot\system32\slmgr.vbs" /dli 2>&1 | Out-String
+    if ($result -match 'KMS') { "KMS" } elseif ($result -match 'MAK|Retail|OEM') { "MAK/Retail/OEM" } else { "Unknown" }
+  changed_when: false
+  ignore_errors: true
+  register: activation_check
+
+- name: INFO Windows activation type
+  ansible.builtin.debug:
+    msg: "Activation type: {{ activation_check.stdout | trim }} — KMS will require re-activation after migration (hypervisor UUID changes)"
+  when: activation_check.stdout | trim == 'KMS'
+  changed_when: false
+
+# ============ HIGH: VMware NSX / vShield agent ============
+# NSX guest introspection agents are hypervisor-coupled and will break
+# network traffic or fail silently on KVM.
+
+- name: Check for NSX or vShield agent services
+  ansible.windows.win_shell: |
+    $svcs = Get-Service -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -match 'vsepflt|vnetflt|nsx|VShield' }
+    if ($svcs) { $svcs.Name -join ', ' } else { "" }
+  changed_when: false
+  ignore_errors: true
+  register: nsx_win_check
+  failed_when: nsx_win_check.stdout | trim | length > 0
+
+# ============ HIGH: VMware Horizon / VDI agent ============
+# VDI agents are VMware-specific and non-functional on KVM.
+
+- name: Check for VMware Horizon or View agent
+  ansible.windows.win_shell: |
+    $pkg = Get-Package -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -match 'Horizon|VMware View|ViewAgent' }
+    if ($pkg) { $pkg.Name -join ', ' } else { "" }
+  changed_when: false
+  ignore_errors: true
+  register: horizon_win_check
+  failed_when: horizon_win_check.stdout | trim | length > 0
+
+# ============ HIGH: EDR / AV agent detection ============
+# EDR agents with tamper protection (CrowdStrike, SentinelOne, Defender ATP, etc.)
+# use minifilter drivers and kernel callbacks that can intercept virt-v2v's disk
+# write phase and block qemu-guest-agent MSI installation post-migration via
+# process execution rules. Add qemu-ga.exe to the EDR allow-list before migrating.
+
+- name: Detect running EDR or AV services (Windows)
+  ansible.builtin.set_fact:
+    edr_svcs_running: >-
+      {{
+        ansible_facts.services
+        | dict2items
+        | selectattr('key', 'in', [
+            'CSFalconService',
+            'CbDefense',
+            'CarbonBlack',
+            'SentinelAgent',
+            'CylanceSvc',
+            'SophosMcsAgent',
+            'TmCCSF',
+            'WinDefend'
+          ])
+        | selectattr('value.state', 'equalto', 'running')
+        | map(attribute='key')
+        | list
+      }}
+
+- name: Check for EDR or AV agent services
+  ansible.builtin.debug:
+    msg: "EDR/AV services running: {{ edr_svcs_running | join(', ') }}"
+  failed_when: edr_svcs_running | length > 0
+  changed_when: false
+  ignore_errors: true
+  register: edr_win_check
+
+# ============ HIGH: Running databases ============
+# Databases must be quiesced before disk snapshot to avoid data corruption.
+
+- name: Check for running database services
+  ansible.builtin.debug:
+    msg: "Database service(s) running: {{ db_svcs_running | join(', ') }}"
+  vars:
+    db_svcs_running: >-
+      {{
+        (['MSSQLSERVER'] if 'MSSQLSERVER' in ansible_facts.services and ansible_facts.services['MSSQLSERVER'].state == 'running' else []) +
+        (['MSExchangeIS'] if 'MSExchangeIS' in ansible_facts.services and ansible_facts.services['MSExchangeIS'].state == 'running' else []) +
+        (['MySQL'] if 'MySQL' in ansible_facts.services and ansible_facts.services['MySQL'].state == 'running' else []) +
+        (['OracleServiceORCL'] if 'OracleServiceORCL' in ansible_facts.services and ansible_facts.services['OracleServiceORCL'].state == 'running' else []) +
+        (['MongoDB'] if 'MongoDB' in ansible_facts.services and ansible_facts.services['MongoDB'].state == 'running' else [])
+      }}
+  failed_when: db_svcs_running | length > 0
+  changed_when: false
+  ignore_errors: true
+  register: db_win_check
+
+# ============ HIGH: C: drive free space ============
+# virt-v2v needs working space on the system volume during conversion.
+
+- name: Check C drive has sufficient free space
+  ansible.windows.win_shell: |
+    $drive = Get-PSDrive C
+    [math]::Round($drive.Free / 1GB, 2)
+  changed_when: false
+  ignore_errors: true
+  register: c_drive_space_check
+  failed_when: c_drive_space_check.stdout | trim | float < 2
+
+- name: INFO C drive free space
+  ansible.builtin.debug:
+    msg: "C: free space: {{ c_drive_space_check.stdout | trim }} GB"
+
+# ============ HIGH: VSS health ============
+# virt-v2v takes a VSS snapshot of the Windows disk for conversion.
+# Three conditions must hold: the VSS service must not be disabled, all
+# writers must be in a stable state, and the Microsoft Software provider
+# must be registered. Any failure here makes a consistent snapshot impossible.
+
+- name: Check VSS service is not disabled
+  ansible.windows.win_shell: |
+    $svc = Get-Service -Name VSS -ErrorAction SilentlyContinue
+    if ($svc -and $svc.StartType -eq 'Disabled') { "VSS service is Disabled" } else { "" }
+  changed_when: false
+  ignore_errors: true
+  register: vss_svc_check
+  failed_when: vss_svc_check.stdout | trim | length > 0
+
+- name: Check VSS writers are healthy
+  ansible.windows.win_shell: |
+    $out = vssadmin list writers 2>&1 | Out-String
+    $bad = @()
+    # Collect every writer name paired with its Last error line
+    $blocks = $out -split '(?=Writer name:)'
+    foreach ($block in $blocks) {
+      # Match each field separately so $Matches is not overwritten before being read
+      $name = if ($block -match 'Writer name:\s*''?(.+?)''?\r?\n') { $Matches[1].Trim() } else { $null }
+      $err  = if ($block -match 'Last error:\s*(.+?)\r?\n')        { $Matches[1].Trim() } else { $null }
+      if ($name -and $err -and $err -notmatch '^No error') {
+        $bad += "$name ($err)"
+      }
+    }
+    # Also catch numeric state codes that indicate non-stable states
+    if ($out -match '\[(7|8|9|11)\]') { $bad += "non-stable state code detected" }
+    if ($bad) { $bad -join '; ' } else { "" }
+  changed_when: false
+  ignore_errors: true
+  register: vss_check
+  failed_when: vss_check.stdout | trim | length > 0
+
+- name: INFO VSS writer details
+  ansible.windows.win_shell: |
+    vssadmin list writers 2>&1 | Select-String -Pattern 'Writer name:|State:|Last error:'
+  changed_when: false
+  ignore_errors: true
+  register: vss_writers_info
+
+- name: INFO VSS writer summary
+  ansible.builtin.debug:
+    msg: "{{ vss_writers_info.stdout_lines }}"
+
+- name: Check VSS Microsoft Software provider is registered
+  ansible.windows.win_shell: |
+    $prov = vssadmin list providers 2>&1 | Out-String
+    if ($prov -notmatch 'Microsoft Software Shadow Copy provider') {
+      "Microsoft VSS provider missing or not registered"
+    } else { "" }
+  changed_when: false
+  ignore_errors: true
+  register: vss_provider_check
+  failed_when: vss_provider_check.stdout | trim | length > 0
+
+# ============ MEDIUM: Hyper-V role ============
+# Hyper-V conflicts with KVM; the VM cannot use both hypervisors unless
+# nested virtualization is explicitly enabled on the KVM host.
+
+- name: Check Hyper-V role is not installed
+  ansible.windows.win_shell: |
+    $hv = Get-WindowsFeature -Name Hyper-V -ErrorAction SilentlyContinue
+    if ($hv -and $hv.InstallState -eq 'Installed') { "Hyper-V installed" } else { "" }
+  changed_when: false
+  ignore_errors: true
+  register: hyperv_check
+  failed_when: hyperv_check.stdout | trim | length > 0
+
+# ============ MEDIUM: Static IP configuration ============
+# NIC MAC address changes post-migration; static IPs bound to the old
+# adapter will go offline unless the network mapping is updated.
+
+- name: Check for static IP configuration
+  ansible.windows.win_shell: |
+    $static = Get-NetIPAddress -AddressFamily IPv4 |
+      Where-Object { $_.PrefixOrigin -eq 'Manual' }
+    if ($static) { $static.IPAddress -join ', ' } else { "" }
+  changed_when: false
+  ignore_errors: true
+  register: static_ip_win_check
+
+- name: INFO Static IP configuration
+  ansible.builtin.debug:
+    msg: "Static IPs found: {{ static_ip_win_check.stdout | trim }} — verify NIC mapping in KubeVirt VM spec"
+  when: static_ip_win_check.stdout | trim | length > 0
+  changed_when: false
+
+# ============ MEDIUM: Partition table type ============
+# MBR is limited to 2 TB and may require additional handling for large disks.
+
+- name: Check partition table type
+  ansible.windows.win_shell: |
+    $mbr = Get-Disk | Where-Object { $_.PartitionStyle -eq 'MBR' }
+    if ($mbr) { "MBR disks: " + (($mbr.Number | ForEach-Object { $_.ToString() }) -join ', ') } else { "" }
+  changed_when: false
+  ignore_errors: true
+  register: partition_win_check
+  failed_when: partition_win_check.stdout | trim | length > 0
+
+# ============ MEDIUM: Pending Windows updates ============
+# A large update queue increases the risk of a reboot loop post-migration.
+
+- name: Check pending Windows updates
+  ansible.windows.win_shell: |
+    $session = New-Object -ComObject Microsoft.Update.Session
+    ($session.CreateUpdateSearcher().Search("IsInstalled=0 and IsHidden=0")).Updates.Count
+  changed_when: false
+  ignore_errors: true
+  register: win_updates_check
+
+- name: INFO Pending Windows updates
+  ansible.builtin.debug:
+    msg: "Pending Windows updates: {{ win_updates_check.stdout | trim }}"
+  when: win_updates_check.stdout | trim | int > 0
+  changed_when: false
+
+# ============ MEDIUM: Domain membership ============
+# Domain-joined VMs require DNS and DC reachability at first boot;
+# network changes post-migration can break domain trust.
+
+- name: INFO Domain membership
+  ansible.windows.win_shell: |
+    $cs = Get-WmiObject Win32_ComputerSystem
+    if ($cs.PartOfDomain) { "Domain: $($cs.Domain)" } else { "Workgroup: $($cs.Workgroup)" }
+  changed_when: false
+  ignore_errors: true
+  register: domain_check
+
+- name: INFO Domain or workgroup
+  ansible.builtin.debug:
+    msg: "{{ domain_check.stdout | trim }}"
+
+# ============ MEDIUM: Page file configuration ============
+# Drive letters can shift if disk order changes; non-C: page files may
+# become inaccessible.
+
+- name: INFO Page file configuration
+  ansible.windows.win_shell: |
+    $pf = Get-WmiObject Win32_PageFileSetting -ErrorAction SilentlyContinue
+    if ($pf) { $pf.Name -join ', ' } else { "System managed" }
+  changed_when: false
+  ignore_errors: true
+  register: pagefile_check
+
+- name: INFO Page file location
+  ansible.builtin.debug:
+    msg: "Page file(s): {{ pagefile_check.stdout | trim }}"
+
+# ============ LOW: RDP enabled ============
+# Confirms remote access will be available after migration.
+
+- name: Check RDP is enabled
+  ansible.windows.win_shell: |
+    $val = (Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server').fDenyTSConnections
+    if ($val -eq 0) { "enabled" } else { "disabled" }
+  changed_when: false
+  ignore_errors: true
+  register: rdp_check
+  failed_when: rdp_check.stdout | trim == 'disabled'
+
+# ============ LOW: VMware registry keys ============
+# Documents VMware software inventory for post-migration cleanup reference.
+
+- name: INFO VMware registry keys
+  ansible.windows.win_shell: |
+    if (Test-Path 'HKLM:\SOFTWARE\VMware, Inc.') { "found" } else { "absent" }
+  changed_when: false
+  ignore_errors: true
+  register: vmware_registry_check
+
+- name: INFO VMware registry presence
+  ansible.builtin.debug:
+    msg: "VMware registry keys (HKLM:\\SOFTWARE\\VMware, Inc.): {{ vmware_registry_check.stdout | trim }}"
+
+# ============ INFO: Disk inventory ============
+
+- name: INFO Disk inventory
+  ansible.windows.win_shell: |
+    Get-Disk | ForEach-Object {
+      "Disk $($_.Number): $([math]::Round($_.Size/1GB,1)) GB — $($_.PartitionStyle) — $($_.OperationalStatus)"
+    }
+  changed_when: false
+  ignore_errors: true
+  register: disk_info_check
+
+- name: INFO Disk details
+  ansible.builtin.debug:
+    msg: "{{ disk_info_check.stdout_lines }}"
+
+# ============ INFO: NIC inventory ============
+
+- name: Gather NIC inventory (Windows)
+  ansible.windows.win_shell: |
+    $nics = Get-NetAdapter | Where-Object { $_.InterfaceType -ne 24 }
+    foreach ($nic in $nics) {
+      $ip = (Get-NetIPAddress -InterfaceIndex $nic.IfIndex -AddressFamily IPv4 `
+        -ErrorAction SilentlyContinue |
+        Where-Object { $_.PrefixOrigin -ne 'WellKnown' } |
+        Select-Object -First 1).IPAddress
+      "$($nic.Name): mac=$($nic.MacAddress) ip=$(if ($ip) { $ip } else { 'no-ip' }) mtu=$($nic.ActiveMaximumTransmissionUnit) [$($nic.InterfaceDescription)]"
+    }
+  changed_when: false
+  ignore_errors: true
+  register: win_nic_inventory
+
+- name: INFO Network interface count
+  ansible.builtin.debug:
+    msg: "NICs (excluding loopback): {{ win_nic_inventory.stdout_lines | length }}"
+
+- name: INFO NIC details
+  ansible.builtin.debug:
+    msg: "{{ win_nic_inventory.stdout_lines }}"
+
+- name: Warn if multiple NICs detected
+  ansible.builtin.debug:
+    msg: "WARNING: {{ win_nic_inventory.stdout_lines | length }} NICs detected — ensure all are mapped to target networks in KubeVirt VM spec"
+  when: win_nic_inventory.stdout_lines | length > 1
+  changed_when: false
+
+# ============ AGGREGATION: Report all failures at the end ============
+
+- name: Set guest failed checks (Windows)
+  ansible.builtin.set_fact:
+    guest_failed_checks: >-
+      {{
+        [
+          {'label': '[CRITICAL] BitLocker', 'msg': 'BitLocker encrypted volumes detected — virt-v2v cannot read encrypted volumes: ' + (bitlocker_check.stdout | trim)} if bitlocker_check is defined and 'failed' in bitlocker_check and bitlocker_check.failed else None,
+          {'label': '[CRITICAL] Dynamic disks', 'msg': 'Dynamic disks detected — virt-v2v only supports Basic disk layout: ' + (dynamic_disk_check.stdout | trim)} if dynamic_disk_check is defined and 'failed' in dynamic_disk_check and dynamic_disk_check.failed else None,
+          {'label': '[CRITICAL] ReFS volumes', 'msg': 'ReFS volumes detected — virt-v2v has no ReFS support: ' + (refs_check.stdout | trim)} if refs_check is defined and 'failed' in refs_check and refs_check.failed else None,
+          {'label': '[CRITICAL] Windows version', 'msg': 'Windows version is below minimum (6.1 / Windows 7 / Server 2008 R2) supported by virt-v2v'} if win_version_check is defined and 'failed' in win_version_check and win_version_check.failed else None,
+          {'label': '[CRITICAL] Secure Boot', 'msg': 'Secure Boot is enabled — virtio drivers must be signed for the target platform'} if secure_boot_win_check is defined and 'failed' in secure_boot_win_check and secure_boot_win_check.failed else None,
+          {'label': '[CRITICAL] Pending reboot', 'msg': 'System has a pending reboot — resolve before migration to avoid inconsistent disk state'} if pending_reboot_check is defined and 'failed' in pending_reboot_check and pending_reboot_check.failed else None,
+          {'label': '[CRITICAL] BCD store', 'msg': 'BCD store integrity check failed — boot configuration may be corrupt'} if bcd_check is defined and 'failed' in bcd_check and bcd_check.failed else None,
+          {'label': '[HIGH] VMware Tools absent', 'msg': 'VMware Tools is not installed — virt-v2v cannot perform clean driver removal'} if vmtools_installed_check is defined and 'failed' in vmtools_installed_check and vmtools_installed_check.failed else None,
+          {'label': '[HIGH] VMware Tools service', 'msg': 'VMware Tools service (VMTools) is not in running state'} if vmtools_svc_check is defined and 'failed' in vmtools_svc_check and vmtools_svc_check.failed else None,
+          {'label': '[HIGH] NSX/vShield agent', 'msg': 'VMware NSX or vShield agent detected — will break network on KVM: ' + (nsx_win_check.stdout | trim)} if nsx_win_check is defined and 'failed' in nsx_win_check and nsx_win_check.failed else None,
+          {'label': '[HIGH] Horizon/VDI agent', 'msg': 'VMware Horizon or View agent detected — non-functional on KVM: ' + (horizon_win_check.stdout | trim)} if horizon_win_check is defined and 'failed' in horizon_win_check and horizon_win_check.failed else None,
+          {'label': '[HIGH] EDR/AV agent', 'msg': 'EDR/AV service running — may block virt-v2v conversion and QEMU-GA install post-migration. Add qemu-ga.exe to EDR allow-list before migrating: ' + (edr_svcs_running | join(', '))} if edr_win_check is defined and 'failed' in edr_win_check and edr_win_check.failed else None,
+          {'label': '[HIGH] Running databases', 'msg': 'Database services are running without a quiesce plan — risk of data corruption'} if db_win_check is defined and 'failed' in db_win_check and db_win_check.failed else None,
+          {'label': '[HIGH] C: drive space', 'msg': 'C: drive has less than 2 GB free — insufficient for virt-v2v conversion workspace'} if c_drive_space_check is defined and 'failed' in c_drive_space_check and c_drive_space_check.failed else None,
+          {'label': '[HIGH] VSS service disabled', 'msg': 'VSS service StartType is Disabled — virt-v2v cannot take a shadow copy snapshot'} if vss_svc_check is defined and 'failed' in vss_svc_check and vss_svc_check.failed else None,
+          {'label': '[HIGH] VSS writers', 'msg': 'One or more VSS writers are in a non-stable state: ' + (vss_check.stdout | trim)} if vss_check is defined and 'failed' in vss_check and vss_check.failed else None,
+          {'label': '[HIGH] VSS provider missing', 'msg': 'Microsoft Software Shadow Copy provider is not registered — shadow copy creation will fail'} if vss_provider_check is defined and 'failed' in vss_provider_check and vss_provider_check.failed else None,
+          {'label': '[MEDIUM] Hyper-V role', 'msg': 'Hyper-V role is installed — conflicts with KVM unless nested virtualization is explicitly configured'} if hyperv_check is defined and 'failed' in hyperv_check and hyperv_check.failed else None,
+          {'label': '[MEDIUM] Partition table (MBR)', 'msg': 'MBR partition table detected — ' + (partition_win_check.stdout | trim)} if partition_win_check is defined and 'failed' in partition_win_check and partition_win_check.failed else None,
+          {'label': '[LOW] RDP disabled', 'msg': 'RDP is disabled — remote access will not be available after migration'} if rdp_check is defined and 'failed' in rdp_check and rdp_check.failed else None
+        ] | reject('equalto', None) | list
+      }}
