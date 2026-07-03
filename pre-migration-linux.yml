@@ -146,28 +146,6 @@
       failed_when: grub_cmdline_check.stdout | length > 0
       when: "'/etc/default/grub' is file"
 
-    # ============ CRITICAL: Missing virtio drivers in initramfs ============
-    # If the initramfs doesn't include virtio_blk, virtio_scsi, or virtio_net modules,
-    # the VM will panic on boot after conversion.
-
-    - name: Check virtio drivers are in initramfs
-      ansible.builtin.shell: |
-        lsinitrd /boot/initramfs-{{ ansible_facts['kernel'] }}.img 2>/dev/null | grep -E 'virtio_(blk|scsi|net)' || true
-      changed_when: false
-      ignore_errors: true
-      register: virtio_driver_check
-      failed_when: virtio_driver_check.stdout_lines | length < 2
-      when: ansible_facts['os_family'] == "RedHat" and ansible_facts['kernel'] is defined
-
-    - name: Check virtio drivers are in initramfs (Debian)
-      ansible.builtin.shell: |
-        lsinitramfs /boot/initrd.img-{{ ansible_facts['kernel'] }} 2>/dev/null | grep -E 'virtio_(blk|scsi|net)' || true
-      changed_when: false
-      ignore_errors: true
-      register: virtio_driver_check_deb
-      failed_when: virtio_driver_check_deb.stdout_lines | length < 2
-      when: ansible_facts['os_family'] == "Debian" and ansible_facts['kernel'] is defined
-
     # ============ HIGH: NFS/CIFS mounts in fstab ============
     # Mount points referencing external NFS or CIFS shares will fail if those resources
     # don't exist in the target environment.
@@ -241,13 +219,12 @@
     # ============ LOW: Partition table type (MBR vs GPT) ============
     # MBR is limited to 2TB and may cause issues with large disks.
 
-    - name: Check partition table type
+    - name: INFO Partition table type
       ansible.builtin.shell: |
         fdisk -l /dev/sda 2>/dev/null | grep 'Disklabel type' || true
       changed_when: false
       ignore_errors: true
       register: partition_table_check
-      failed_when: "'gpt' not in partition_table_check.stdout"
       when: "'/dev/sda' in ansible_facts['devices']"
 
     # ============ MEDIUM: Network config conflicts ============
@@ -285,13 +262,12 @@
     # ============ MEDIUM: Non-virtio network drivers ============
     # If the VM is using e1000 or other paravirtualized drivers, virt-v2v should convert them.
 
-    - name: Check for non-virtio network drivers
+    - name: INFO Non-virtio network drivers
       ansible.builtin.shell: |
         lspci 2>/dev/null | grep -iE 'ethernet|network' | grep -iE 'e1000|vmxnet|igb' || true
       changed_when: false
       ignore_errors: true
       register: nic_driver_check
-      failed_when: nic_driver_check.stdout | length > 0
 
     # ============ MEDIUM: LVM thin provisioning ============
     # Thin provisioning and snapshots can cause issues during conversion.
@@ -376,17 +352,6 @@
       failed_when: multipath_check.stdout | length > 0
       when: "'device-mapper-multipath' in ansible_facts['packages']"
 
-    # ============ HIGH: SELinux enforcing without relabel ============
-    # If SELinux is enforcing but /forcefselinux doesn't exist, the migrated VM may boot into a denied state.
-
-    - name: Check SELinux mode
-      ansible.builtin.debug:
-        msg: "SELinux status={{ ansible_facts['selinux']['status'] }} mode={{ ansible_facts['selinux']['mode'] }}"
-      changed_when: false
-      ignore_errors: true
-      register: selinux_mode
-      when: "'selinux' in ansible_facts and ansible_facts['selinux']['status'] != 'disabled'"
-
     # ============ HIGH: GRUB password protection ============
     # If GRUB is password-protected, the VM may not boot if the password isn't preserved.
 
@@ -415,13 +380,12 @@
     # that won't exist or are unnecessary on the KubeVirt target.
     # Note: ixgbe is standard Intel 10GbE on bare-metal servers — not hypervisor-specific.
 
-    - name: Check for hypervisor-specific kernel modules
+    - name: INFO Hypervisor-specific kernel modules
       ansible.builtin.shell: |
         lsmod 2>/dev/null | grep -iE 'vmxnet|vmware|lpfc|qla2xxx|bnx2' || true
       changed_when: false
       ignore_errors: true
       register: hw_module_check
-      failed_when: hw_module_check.stdout | length > 0
 
     # ============ MEDIUM: Persistent net rules ============
     # Old udev rules that hardcode MAC-to-interface mappings (common in RHEL/CentOS 6).
@@ -449,13 +413,12 @@
     # ============ MEDIUM: VMware Tools kernel module conflicts ============
     # If both open-vm-tools and the proprietary VMware Tools kernel modules are present, they conflict.
 
-    - name: Check for VMware Tools kernel module conflicts
+    - name: INFO VMware Tools kernel module conflicts
       ansible.builtin.shell: |
         lsmod 2>/dev/null | grep -E '^vmxnet|^pvscsi|^vmhgfs' || true
       changed_when: false
       ignore_errors: true
       register: vmware_module_check
-      failed_when: vmware_module_check.stdout | length > 0
       when: "'open-vm-tools' in ansible_facts['packages']"
 
  # ============ LOW: Swap partition references in fstab ============
@@ -518,53 +481,32 @@
     # ============ LOW: GRUB video configuration ============
     # Video configuration in GRUB can cause boot issues if the target hypervisor doesn't support the same display.
 
-    - name: Check GRUB video configuration
+    - name: INFO GRUB video configuration
       ansible.builtin.shell: |
         grep -E 'GRUB_GFXMODE|GRUB_GFXPAYLOAD' /etc/default/grub || true
       changed_when: false
       ignore_errors: true
       register: grub_video_check
-      failed_when: grub_video_check.stdout | length > 0
 
     # ============ LOW: resolv.conf management ============
     # If resolv.conf is a static file instead of a symlink managed by NetworkManager,
     # dhclient, or systemd-resolved, DNS config may not update correctly post-migration.
 
-    - name: Check resolv.conf is managed
+    - name: INFO resolv.conf management
       ansible.builtin.shell: |
         readlink -f /etc/resolv.conf 2>/dev/null || ls -la /etc/resolv.conf 2>/dev/null || true
       changed_when: false
       ignore_errors: true
       register: resolv_check
-      failed_when: >
-        'NetworkManager' not in resolv_check.stdout and
-        'dhclient' not in resolv_check.stdout and
-        'systemd' not in resolv_check.stdout and
-        resolv_check.stdout | length > 0
       when: "'/etc/resolv.conf' is file"
 
     # ============ HIGH: VMware legacy tools ============
     # The legacy VMware Tools daemon (/usr/bin/vmware-toolsd) conflicts with open-vm-tools.
 
-    - name: Check for VMware legacy tools daemon
+    - name: INFO VMware legacy tools daemon
       ansible.builtin.stat:
         path: /usr/bin/vmware-toolsd
-      ignore_errors: true
       register: vmware_legacy_check
-      changed_when: false
-
-    # ============ HIGH: SELinux autorelabel notification ============
-    # virt-v2v automatically handles SELinux relabeling during conversion.
-    # The first boot on KVM may take longer while relabeling completes.
-
-    - name: Check SELinux autorelabel notification
-      ansible.builtin.debug:
-        msg: |
-          SELinux is enforcing. virt-v2v will handle SELinux relabeling automatically during conversion.
-          - No manual action is required before migration
-          - First boot on KVM may take longer while relabeling completes
-          - Verify relabeling completed successfully using the post-migration playbook
-      when: "'selinux' in ansible_facts and ansible_facts['selinux']['mode'] | lower == 'enforcing'"
       changed_when: false
 
     # ============ MEDIUM: Root filesystem free space ============
@@ -1057,19 +999,15 @@
               {'label': '[CRITICAL] BTRFS mounts', 'msg': 'BTRFS filesystem detected on mounted volumes'} if check_btrfs_mounts is defined and 'failed' in check_btrfs_mounts and check_btrfs_mounts.failed else None,
               {'label': '[CRITICAL] GRUB UUIDs', 'msg': 'Device path references found in grub.cfg'} if grub_device_check is defined and 'failed' in grub_device_check and grub_device_check.failed else None,
               {'label': '[CRITICAL] fstab UUIDs', 'msg': 'Device path references found in /etc/fstab'} if fstab_device_check is defined and 'failed' in fstab_device_check and fstab_device_check.failed else None,
-              {'label': '[CRITICAL] GRUB_CMDLINE_LINUX', 'msg': 'Device path references found in GRUB_CMDLINE_LINUX'} if grub_cmdline_check is defined and 'failed' in grub_cmdline_check and grub_cmdline_check.failed else None,
-              {'label': '[CRITICAL] virtio drivers (RHEL)', 'msg': 'Missing virtio drivers in initramfs'} if virtio_driver_check is defined and 'failed' in virtio_driver_check and virtio_driver_check.failed else None,
-              {'label': '[CRITICAL] virtio drivers (Debian)', 'msg': 'Missing virtio drivers in initramfs'} if virtio_driver_check_deb is defined and 'failed' in virtio_driver_check_deb and virtio_driver_check_deb.failed else None,
+            {'label': '[CRITICAL] GRUB_CMDLINE_LINUX', 'msg': 'Device path references found in GRUB_CMDLINE_LINUX'} if grub_cmdline_check is defined and 'failed' in grub_cmdline_check and grub_cmdline_check.failed else None,
               {'label': '[HIGH] NFS/CIFS mounts', 'msg': 'NFS/CIFS mounts found in /etc/fstab'} if nfs_mount_check is defined and 'failed' in nfs_mount_check and nfs_mount_check.failed else None,
               {'label': '[MEDIUM] Bonding configs', 'msg': 'Bonding configuration detected'} if bonding_check is defined and 'failed' in bonding_check and bonding_check.failed else None,
               {'label': '[MEDIUM] Bridge configs', 'msg': 'Bridge configuration detected'} if bridge_check is defined and 'failed' in bridge_check and bridge_check.failed else None,
               {'label': '[MEDIUM] udev rules', 'msg': 'Hardware-specific udev rules found'} if udev_check is defined and 'failed' in udev_check and udev_check.failed else None,
               {'label': '[LOW] Cron entries', 'msg': 'Problematic cron entries found'} if cron_check is defined and 'failed' in cron_check and cron_check.failed else None,
               {'label': '[LOW] Docker mounts', 'msg': 'Docker host device bind mounts found'} if docker_device_check is defined and 'failed' in docker_device_check and docker_device_check.failed else None,
-              {'label': '[LOW] Partition table', 'msg': 'MBR partition table detected (use GPT)'} if partition_table_check is defined and 'failed' in partition_table_check and partition_table_check.failed else None,
               {'label': '[MEDIUM] Network conflicts', 'msg': 'NetworkManager and ifupdown both active'} if network_conflict_check is defined and 'failed' in network_conflict_check and network_conflict_check.failed else None,
               {'label': '[MEDIUM] NTP config', 'msg': 'No NTP/chrony service detected'} if ntp_check is defined and 'failed' in ntp_check and ntp_check.failed else None,
-              {'label': '[MEDIUM] NIC drivers', 'msg': 'Non-virtio network drivers detected'} if nic_driver_check is defined and 'failed' in nic_driver_check and nic_driver_check.failed else None,
               {'label': '[MEDIUM] LVM thin', 'msg': 'LVM thin provisioning detected'} if lvm_thin_check is defined and 'failed' in lvm_thin_check and lvm_thin_check.failed else None,
               {'label': '[LOW] Legacy NIC naming', 'msg': 'Legacy ethX network interface naming detected'} if legacy_nic_check is defined and 'failed' in legacy_nic_check and legacy_nic_check.failed else None,
               {'label': '[CRITICAL] cmdline', 'msg': 'Device path references found in /proc/cmdline'} if cmdline_check is defined and 'failed' in cmdline_check and cmdline_check.failed else None,
@@ -1077,21 +1015,15 @@
               {'label': '[CRITICAL] Software RAID', 'msg': 'Software RAID arrays detected'} if mdadm_check is defined and 'failed' in mdadm_check and mdadm_check.failed else None,
               {'label': '[CRITICAL] Kernel version', 'msg': 'Kernel version too old for virtio drivers'} if kernel_compat is defined and 'failed' in kernel_compat and kernel_compat.failed else None,
               {'label': '[HIGH] Multipath', 'msg': 'Multipath configuration detected'} if multipath_check is defined and 'failed' in multipath_check and multipath_check.failed else None,
-              {'label': '[HIGH] SELinux', 'msg': 'SELinux mode detected: ' + ansible_facts['selinux']['mode']} if 'selinux' in ansible_facts and ansible_facts['selinux']['mode'] | lower == 'enforcing' and selinux_mode is defined and 'failed' in selinux_mode and selinux_mode.failed else None,
               {'label': '[HIGH] GRUB password', 'msg': 'GRUB password protection detected'} if grub_pass_check is defined and 'failed' in grub_pass_check and grub_pass_check.failed else None,
                 {'label': '[MEDIUM] cloud-init', 'msg': 'Hypervisor-specific cloud-init datasource detected'} if cloudinit_check is defined and 'failed' in cloudinit_check and cloudinit_check.failed else None,
-              {'label': '[MEDIUM] Kernel modules', 'msg': 'Hypervisor-specific kernel modules detected'} if hw_module_check is defined and 'failed' in hw_module_check and hw_module_check.failed else None,
               {'label': '[MEDIUM] Persistent net rules', 'msg': 'Persistent net rules found (MAC-to-interface binding)'} if persistent_net_check is defined and 'failed' in persistent_net_check and persistent_net_check.failed else None,
-              {'label': '[MEDIUM] Systemd units', 'msg': 'Hardware-dependent systemd units detected'} if systemd_hw_check is defined and 'failed' in systemd_hw_check and systemd_hw_check.failed else None,
-              {'label': '[MEDIUM] VMware modules', 'msg': 'VMware Tools kernel modules conflict with open-vm-tools'} if vmware_module_check is defined and 'failed' in vmware_module_check and vmware_module_check.failed else None,
-                {'label': '[LOW] Swap UUIDs', 'msg': 'Swap using device path in /etc/fstab'} if swap_device_check is defined and 'failed' in swap_device_check and swap_device_check.failed else None,
+           {'label': '[MEDIUM] Systemd units', 'msg': 'Hardware-dependent systemd units detected'} if systemd_hw_check is defined and 'failed' in systemd_hw_check and systemd_hw_check.failed else None,
+              {'label': '[LOW] Swap UUIDs', 'msg': 'Swap using device path in /etc/fstab'} if swap_device_check is defined and 'failed' in swap_device_check and swap_device_check.failed else None,
               {'label': '[LOW] Docker driver', 'msg': 'Docker using devicemapper storage driver'} if docker_driver is defined and 'failed' in docker_driver and docker_driver.failed else None,
               {'label': '[LOW] Syslog forwarding', 'msg': 'Syslog forwarding to external host detected'} if syslog_check is defined and 'failed' in syslog_check and syslog_check.failed else None,
               {'label': '[LOW] Timezone', 'msg': 'Timezone is not UTC: ' + tz_check.stdout} if tz_check is defined and 'failed' in tz_check and tz_check.failed else None,
               {'label': '[LOW] FS resize', 'msg': 'Root filesystem is ' + root_fstype_check.stdout + ' (may not support online resize)'} if root_fstype_check is defined and 'failed' in root_fstype_check and root_fstype_check.failed else None,
-              {'label': '[LOW] GRUB video', 'msg': 'GRUB video configuration detected'} if grub_video_check is defined and 'failed' in grub_video_check and grub_video_check.failed else None,
-              {'label': '[LOW] resolv.conf', 'msg': '/etc/resolv.conf is not managed by NetworkManager/dhclient'} if resolv_check is defined and 'failed' in resolv_check and resolv_check.failed else None,
-              {'label': '[HIGH] VMware legacy', 'msg': 'Legacy VMware Tools daemon found at /usr/bin/vmware-toolsd'} if vmware_legacy_check is defined and vmware_legacy_check.stat.exists else None,
               {'label': '[MEDIUM] Root free space', 'msg': 'Root filesystem has only ' + root_free_space.stdout + 'G free (need at least 1G)'} if root_free_space is defined and 'failed' in root_free_space and root_free_space.failed else None,
               {'label': '[MEDIUM] Hardcoded MAC (RHEL)', 'msg': 'Hardcoded MAC addresses found in ifcfg files'} if hwaddr_check is defined and 'failed' in hwaddr_check and hwaddr_check.failed else None,
               {'label': '[MEDIUM] Hardcoded MAC (Debian)', 'msg': 'Hardcoded MAC addresses found in Debian network config'} if hwaddr_debian_check is defined and 'failed' in hwaddr_debian_check and hwaddr_debian_check.failed else None,

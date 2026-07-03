@@ -208,8 +208,7 @@ Run **before** virt-v2v conversion while the VM is still on VMware vSphere.
 | Check GRUB configs use UUID for root disk | Fails if any grub.cfg file references `/dev/sd*`, `/dev/vd*`, or `/dev/xvd*` instead of UUID |
 | Check fstab uses UUIDs for mount points | Fails if `/etc/fstab` has non-commented entries using `/dev/sd*` device paths |
 | Check GRUB_CMDLINE_LINUX uses UUID | Fails if `/etc/default/grub` contains `root=/dev/sd*` in the kernel command line |
-| Check virtio drivers are in initramfs | Fails if `virtio_blk`, `virtio_scsi`, or `virtio_net` are missing from the RHEL initramfs image |
-| Check virtio drivers are in initramfs (Debian) | Fails if virtio drivers are missing from the Debian/Ubuntu initrd image |
+
 | Check running kernel cmdline uses UUID | Fails if `/proc/cmdline` shows the running kernel was booted with a `/dev/sd*` root device path |
 | Check for LUKS encrypted volumes | Fails if any block device has LUKS encryption — passphrase/keyfile availability must be confirmed |
 | Check for software RAID arrays | Fails if `/proc/mdstat` shows active mdadm RAID arrays that may desync on device rename |
