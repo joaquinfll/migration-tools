@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Pre-migration checks for a Windows VM still on VMware vSphere.
@@ -49,13 +49,13 @@ try {
     $bitlockerVolumes = @(Get-BitLockerVolume -ErrorAction SilentlyContinue |
         Where-Object { $_.VolumeStatus -ne 'FullyDecrypted' })
 } catch {
-    # BitLocker cmdlet unavailable on some SKUs — treat as no encrypted volumes.
+    # BitLocker cmdlet unavailable on some SKUs -- treat as no encrypted volumes.
 }
 
 $bitlockerDetail = ($bitlockerVolumes | ForEach-Object { $_.MountPoint }) -join ', '
 $results += New-MigrationCheckResult -Severity CRITICAL -Name 'BitLocker' -Passed (
     $bitlockerVolumes.Count -eq 0
-) -Message "BitLocker encrypted volumes detected — virt-v2v cannot read encrypted volumes: $bitlockerDetail"
+) -Message "BitLocker encrypted volumes detected -- virt-v2v cannot read encrypted volumes: $bitlockerDetail"
 
 # ============ CRITICAL: Dynamic disks ============
 
@@ -67,7 +67,7 @@ $dynamicDetail = $(if ($dynamicDisks) {
 
 $results += New-MigrationCheckResult -Severity CRITICAL -Name 'Dynamic disks' -Passed (
     $dynamicDisks.Count -eq 0
-) -Message "Dynamic disks detected — virt-v2v only supports Basic disk layout: $dynamicDetail"
+) -Message "Dynamic disks detected -- virt-v2v only supports Basic disk layout: $dynamicDetail"
 
 # ============ CRITICAL: ReFS volumes ============
 
@@ -77,7 +77,7 @@ $refsDetail = ($refsVolumes | ForEach-Object { $_.DriveLetter } | Where-Object {
 
 $results += New-MigrationCheckResult -Severity CRITICAL -Name 'ReFS volumes' -Passed (
     $refsVolumes.Count -eq 0
-) -Message "ReFS volumes detected — virt-v2v has no ReFS support: $refsDetail"
+) -Message "ReFS volumes detected -- virt-v2v has no ReFS support: $refsDetail"
 
 # ============ CRITICAL: Windows version compatibility ============
 
@@ -99,7 +99,7 @@ try {
 
 $results += New-MigrationCheckResult -Severity CRITICAL -Name 'Secure Boot' -Passed (
     $secureBootState -ne 'enabled'
-) -Message 'Secure Boot is enabled — virtio drivers must be signed for the target platform'
+) -Message 'Secure Boot is enabled -- virtio drivers must be signed for the target platform'
 
 # ============ CRITICAL: Pending reboot ============
 
@@ -116,7 +116,7 @@ $pfro = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager
 if ($pfro) { $rebootPending = $true }
 
 $results += New-MigrationCheckResult -Severity CRITICAL -Name 'Pending reboot' -Passed (-not $rebootPending) `
-    -Message 'System has a pending reboot — resolve before migration to avoid inconsistent disk state'
+    -Message 'System has a pending reboot -- resolve before migration to avoid inconsistent disk state'
 
 # ============ CRITICAL: BCD store integrity ============
 
@@ -125,14 +125,14 @@ $bcdFailed = $LASTEXITCODE -ne 0
 $bcdDetail = $(if ($bcdFailed) { "BCD error: $bcdOutput" } else { '' })
 
 $results += New-MigrationCheckResult -Severity CRITICAL -Name 'BCD store' -Passed (-not $bcdFailed) `
-    -Message 'BCD store integrity check failed — boot configuration may be corrupt' -Detail $bcdDetail
+    -Message 'BCD store integrity check failed -- boot configuration may be corrupt' -Detail $bcdDetail
 
 # ============ HIGH: VMware Tools installed ============
 
 $vmtoolsSvc = Get-Service -Name 'VMTools' -ErrorAction SilentlyContinue
 $results += New-MigrationCheckResult -Severity HIGH -Name 'VMware Tools absent' -Passed (
     $null -ne $vmtoolsSvc
-) -Message 'VMware Tools is not installed — virt-v2v cannot perform clean driver removal'
+) -Message 'VMware Tools is not installed -- virt-v2v cannot perform clean driver removal'
 
 $vmtoolsState = Get-ServiceState -ServiceName 'VMTools'
 Write-MigrationInfo "VMTools state: $vmtoolsState"
@@ -158,7 +158,7 @@ $activationType = $(if ($activationResult -match 'KMS') {
 })
 
 if ($activationType -eq 'KMS') {
-    Write-MigrationInfo "Activation type: KMS — KMS will require re-activation after migration (hypervisor UUID changes)"
+    Write-MigrationInfo "Activation type: KMS -- KMS will require re-activation after migration (hypervisor UUID changes)"
 }
 
 # ============ HIGH: VMware NSX / vShield agent ============
@@ -169,7 +169,7 @@ $nsxDetail = ($nsxServices | ForEach-Object { $_.Name }) -join ', '
 
 $results += New-MigrationCheckResult -Severity HIGH -Name 'NSX/vShield agent' -Passed (
     $nsxServices.Count -eq 0
-) -Message "VMware NSX or vShield agent detected — will break network on KVM: $nsxDetail"
+) -Message "VMware NSX or vShield agent detected -- will break network on KVM: $nsxDetail"
 
 # ============ HIGH: VMware Horizon / VDI agent ============
 
@@ -179,7 +179,7 @@ $horizonDetail = ($horizonPackages | ForEach-Object { $_.Name }) -join ', '
 
 $results += New-MigrationCheckResult -Severity HIGH -Name 'Horizon/VDI agent' -Passed (
     $horizonPackages.Count -eq 0
-) -Message "VMware Horizon or View agent detected — non-functional on KVM: $horizonDetail"
+) -Message "VMware Horizon or View agent detected -- non-functional on KVM: $horizonDetail"
 
 # ============ HIGH: EDR / AV agent detection ============
 
@@ -188,7 +188,7 @@ $edrDetail = $edrRunning -join ', '
 
 $results += New-MigrationCheckResult -Severity HIGH -Name 'EDR/AV agent' -Passed (
     $edrRunning.Count -eq 0
-) -Message "EDR/AV service running — may block virt-v2v conversion and QEMU-GA install post-migration. Add qemu-ga.exe to EDR allow-list before migrating: $edrDetail"
+) -Message "EDR/AV service running -- may block virt-v2v conversion and QEMU-GA install post-migration. Add qemu-ga.exe to EDR allow-list before migrating: $edrDetail"
 
 # ============ HIGH: Running databases ============
 
@@ -200,7 +200,7 @@ if ($dbRunning.Count -gt 0) {
 
 $results += New-MigrationCheckResult -Severity HIGH -Name 'Running databases' -Passed (
     $dbRunning.Count -eq 0
-) -Message 'Database services are running without a quiesce plan — risk of data corruption'
+) -Message 'Database services are running without a quiesce plan -- risk of data corruption'
 
 # ============ HIGH: C: drive free space ============
 
@@ -210,7 +210,7 @@ Write-MigrationInfo "C: free space: $cFreeGb GB"
 
 $results += New-MigrationCheckResult -Severity HIGH -Name 'C: drive space' -Passed (
     $cFreeGb -ge 2
-) -Message "C: drive has less than 2 GB free — insufficient for virt-v2v conversion workspace"
+) -Message "C: drive has less than 2 GB free -- insufficient for virt-v2v conversion workspace"
 
 # ============ HIGH: VSS health ============
 
@@ -218,7 +218,7 @@ $vssSvc = Get-Service -Name VSS -ErrorAction SilentlyContinue
 $vssDisabled = $vssSvc -and $vssSvc.StartType -eq 'Disabled'
 
 $results += New-MigrationCheckResult -Severity HIGH -Name 'VSS service disabled' -Passed (-not $vssDisabled) `
-    -Message 'VSS service StartType is Disabled — virt-v2v cannot take a shadow copy snapshot'
+    -Message 'VSS service StartType is Disabled -- virt-v2v cannot take a shadow copy snapshot'
 
 $vssOut = vssadmin list writers 2>&1 | Out-String
 $vssBad = @()
@@ -248,7 +248,7 @@ $vssProviders = vssadmin list providers 2>&1 | Out-String
 $vssProviderMissing = $vssProviders -notmatch 'Microsoft Software Shadow Copy provider'
 
 $results += New-MigrationCheckResult -Severity HIGH -Name 'VSS provider missing' -Passed (-not $vssProviderMissing) `
-    -Message 'Microsoft Software Shadow Copy provider is not registered — shadow copy creation will fail'
+    -Message 'Microsoft Software Shadow Copy provider is not registered -- shadow copy creation will fail'
 
 # ============ MEDIUM: Hyper-V role ============
 
@@ -257,7 +257,7 @@ try {
     $hv = Get-WindowsFeature -Name Hyper-V -ErrorAction Stop
     $hypervInstalled = $hv -and $hv.InstallState -eq 'Installed'
 } catch {
-    # Client SKUs or Server Core without ServerManager — check optional feature name.
+    # Client SKUs or Server Core without ServerManager -- check optional feature name.
     $optional = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All `
         -ErrorAction SilentlyContinue
     if ($optional -and $optional.State -eq 'Enabled') {
@@ -266,7 +266,7 @@ try {
 }
 
 $results += New-MigrationCheckResult -Severity MEDIUM -Name 'Hyper-V role' -Passed (-not $hypervInstalled) `
-    -Message 'Hyper-V role is installed — conflicts with KVM unless nested virtualization is explicitly configured'
+    -Message 'Hyper-V role is installed -- conflicts with KVM unless nested virtualization is explicitly configured'
 
 # ============ MEDIUM: Static IP configuration (informational) ============
 
@@ -274,7 +274,7 @@ $staticIps = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinu
     Where-Object { $_.PrefixOrigin -eq 'Manual' })
 $staticIpText = ($staticIps | ForEach-Object { $_.IPAddress }) -join ', '
 if ($staticIpText) {
-    Write-MigrationInfo "Static IPs found: $staticIpText — verify NIC mapping in KubeVirt VM spec"
+    Write-MigrationInfo "Static IPs found: $staticIpText -- verify NIC mapping in KubeVirt VM spec"
 }
 
 # ============ MEDIUM: Partition table type (MBR) ============
@@ -287,7 +287,7 @@ $mbrDetail = $(if ($mbrDisks) {
 
 $results += New-MigrationCheckResult -Severity MEDIUM -Name 'Partition table (MBR)' -Passed (
     $mbrDisks.Count -eq 0
-) -Message "MBR partition table detected — $mbrDetail"
+) -Message "MBR partition table detected -- $mbrDetail"
 
 # ============ MEDIUM: Pending Windows updates (informational) ============
 
@@ -322,7 +322,7 @@ $rdpValue = (Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal S
 $rdpEnabled = ($rdpValue -eq 0)
 
 $results += New-MigrationCheckResult -Severity LOW -Name 'RDP disabled' -Passed $rdpEnabled `
-    -Message 'RDP is disabled — remote access will not be available after migration'
+    -Message 'RDP is disabled -- remote access will not be available after migration'
 
 # ============ INFO: VMware registry keys ============
 
@@ -332,7 +332,7 @@ Write-MigrationInfo "VMware registry keys (HKLM:\SOFTWARE\VMware, Inc.): $vmware
 # ============ INFO: Disk inventory ============
 
 $diskLines = @(Get-Disk -ErrorAction SilentlyContinue | ForEach-Object {
-    "Disk $($_.Number): $([math]::Round($_.Size / 1GB, 1)) GB — $($_.PartitionStyle) — $($_.OperationalStatus)"
+    "Disk $($_.Number): $([math]::Round($_.Size / 1GB, 1)) GB -- $($_.PartitionStyle) -- $($_.OperationalStatus)"
 })
 if ($diskLines) {
     Write-MigrationInfo "Disk inventory:`n$($diskLines -join "`n")"
@@ -346,7 +346,7 @@ if ($nicLines) {
     Write-MigrationInfo "NIC details:`n$($nicLines -join "`n")"
 }
 if ($nicLines.Count -gt 1) {
-    Write-MigrationWarning "$($nicLines.Count) NICs detected — ensure all are mapped to target networks in KubeVirt VM spec"
+    Write-MigrationWarning "$($nicLines.Count) NICs detected -- ensure all are mapped to target networks in KubeVirt VM spec"
 }
 
 # ============ AGGREGATION ============

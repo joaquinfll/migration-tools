@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Post-migration validation for a Windows VM on KVM / OpenShift Virtualization.
@@ -66,7 +66,7 @@ $virtioNics = @(Get-NetAdapter -ErrorAction SilentlyContinue |
 
 $results += New-MigrationCheckResult -Severity CRITICAL -Name 'virtio-net (NetKVM)' -Passed (
     $virtioNics.Count -gt 0
-) -Message 'No Red Hat VirtIO network adapter found — VM has no virtio NIC'
+) -Message 'No Red Hat VirtIO network adapter found -- VM has no virtio NIC'
 
 $nicDriverLines = @(Get-NetAdapter -ErrorAction SilentlyContinue | ForEach-Object {
     "$($_.Name): $($_.InterfaceDescription) [$($_.Status)]"
@@ -81,7 +81,7 @@ if ($nicLines) {
     Write-MigrationInfo "NIC details:`n$($nicLines -join "`n")"
 }
 if ($nicLines.Count -gt 1) {
-    Write-MigrationWarning "$($nicLines.Count) NICs detected — ensure all are mapped to target networks in KubeVirt VM spec"
+    Write-MigrationWarning "$($nicLines.Count) NICs detected -- ensure all are mapped to target networks in KubeVirt VM spec"
 }
 
 # ============ CRITICAL: virtio storage driver must be loaded ============
@@ -92,10 +92,10 @@ $virtioStorageDrivers = @(Get-CimInstance -ClassName Win32_PnPSignedDriver -Erro
 
 $results += New-MigrationCheckResult -Severity CRITICAL -Name 'virtio storage driver' -Passed (
     $virtioStorageDrivers.Count -gt 0
-) -Message 'VirtIO SCSI or Block storage driver not found — VM cannot access disk via virtio'
+) -Message 'VirtIO SCSI or Block storage driver not found -- VM cannot access disk via virtio'
 
 $diskLines = @(Get-Disk -ErrorAction SilentlyContinue | ForEach-Object {
-    "Disk $($_.Number): $([math]::Round($_.Size / 1GB, 1)) GB — $($_.PartitionStyle)"
+    "Disk $($_.Number): $([math]::Round($_.Size / 1GB, 1)) GB -- $($_.PartitionStyle)"
 })
 if ($diskLines) {
     Write-MigrationInfo "Disk details:`n$($diskLines -join "`n")"
@@ -122,7 +122,7 @@ $results += New-MigrationCheckResult -Severity CRITICAL -Name 'VMware Tools serv
 
 $cAccessible = Test-Path 'C:/'
 $results += New-MigrationCheckResult -Severity CRITICAL -Name 'C: drive inaccessible' -Passed $cAccessible `
-    -Message 'C:\ drive is not accessible — system volume may be unmounted or corrupt'
+    -Message 'C:\ drive is not accessible -- system volume may be unmounted or corrupt'
 
 # ============ HIGH: QEMU Guest Agent must be installed and running ============
 
@@ -142,7 +142,7 @@ if (-not $qgaPassed) {
 
     $results += New-MigrationCheckResult -Severity HIGH -Name 'EDR blocking QEMU-GA' -Passed (
         $edrBlocking.Count -eq 0
-    ) -Message "EDR/AV service is likely blocking QEMU-GA — add qemu-ga.exe to the allow-list and reinstall: $edrDetail"
+    ) -Message "EDR/AV service is likely blocking QEMU-GA -- add qemu-ga.exe to the allow-list and reinstall: $edrDetail"
 }
 
 # ============ HIGH: No VMware services must be running ============
@@ -171,7 +171,7 @@ $activationResult = cscript //NoLogo "$env:SystemRoot\system32\slmgr.vbs" /dli 2
 $licensed = $activationResult -match 'License Status: Licensed'
 
 $results += New-MigrationCheckResult -Severity HIGH -Name 'Windows activation' -Passed $licensed `
-    -Message 'Windows is not in Licensed state — re-activation required (KMS UUID change)'
+    -Message 'Windows is not in Licensed state -- re-activation required (KMS UUID change)'
 
 # ============ HIGH: Network connectivity ============
 
@@ -185,7 +185,7 @@ if ($defaultGateway) {
 
 $results += New-MigrationCheckResult -Severity HIGH -Name 'Default route' -Passed (
     [string]::IsNullOrWhiteSpace($defaultGateway) -eq $false
-) -Message 'No default route found — network may be misconfigured'
+) -Message 'No default route found -- network may be misconfigured'
 
 $ipv4Lines = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
     Where-Object { $_.PrefixOrigin -ne 'WellKnown' } |
@@ -207,7 +207,7 @@ if ($dnsResolved) {
 
 $results += New-MigrationCheckResult -Severity HIGH -Name 'DNS resolution' -Passed (
     [string]::IsNullOrWhiteSpace($dnsResolved) -eq $false
-) -Message 'Hostname does not resolve — DNS may be broken'
+) -Message 'Hostname does not resolve -- DNS may be broken'
 
 # ============ HIGH: No critical Event Log errors since boot ============
 
@@ -245,7 +245,7 @@ $cDrive = Get-PSDrive -Name C -ErrorAction SilentlyContinue
 $cFreeGb = $(if ($cDrive) { [math]::Round($cDrive.Free / 1GB, 2) } else { 0 })
 $cUsedGb = $(if ($cDrive) { [math]::Round($cDrive.Used / 1GB, 1) } else { 0 })
 
-Write-MigrationInfo "C: drive — Used: $cUsedGb GB  Free: $cFreeGb GB"
+Write-MigrationInfo "C: drive -- Used: $cUsedGb GB  Free: $cFreeGb GB"
 
 $results += New-MigrationCheckResult -Severity MEDIUM -Name 'C: drive space' -Passed (
     $cFreeGb -ge 1
@@ -258,7 +258,7 @@ Write-MigrationInfo "W32Time state: $w32TimeState"
 
 $results += New-MigrationCheckResult -Severity MEDIUM -Name 'Time sync (W32Time)' -Passed (
     $w32TimeState -eq 'running'
-) -Message 'Windows Time service is not running — clock drift will break Kerberos and TLS'
+) -Message 'Windows Time service is not running -- clock drift will break Kerberos and TLS'
 
 # ============ MEDIUM: No VMware entries in BCD ============
 
@@ -266,7 +266,7 @@ $bcdOutput = bcdedit /enum all 2>&1 | Out-String
 $bcdVmwareEntries = $bcdOutput -match 'vmware'
 
 $results += New-MigrationCheckResult -Severity MEDIUM -Name 'BCD VMware artifacts' -Passed (-not $bcdVmwareEntries) `
-    -Message 'VMware entries found in BCD store — boot configuration may be contaminated'
+    -Message 'VMware entries found in BCD store -- boot configuration may be contaminated'
 
 # ============ LOW: virtio-serial device for QEMU Guest Agent channel ============
 
@@ -275,7 +275,7 @@ $virtioSerialDevices = @(Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction
 
 $results += New-MigrationCheckResult -Severity LOW -Name 'virtio-serial channel' -Passed (
     $virtioSerialDevices.Count -gt 0
-) -Message 'VirtIO serial device not found — QEMU Guest Agent communication channel may not function'
+) -Message 'VirtIO serial device not found -- QEMU Guest Agent communication channel may not function'
 
 # ============ LOW: RDP still enabled ============
 
@@ -283,7 +283,7 @@ $rdpValue = (Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal S
 $rdpEnabled = ($rdpValue -eq 0)
 
 $results += New-MigrationCheckResult -Severity LOW -Name 'RDP disabled' -Passed $rdpEnabled `
-    -Message 'RDP is disabled — remote access is not available'
+    -Message 'RDP is disabled -- remote access is not available'
 
 # ============ AGGREGATION ============
 

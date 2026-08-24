@@ -1,4 +1,4 @@
-# Shared helpers for Windows migration pre/post check scripts.
+﻿# Shared helpers for Windows migration pre/post check scripts.
 # Mirrors the aggregation pattern used in pre-migration-windows.yml and post-migration-windows.yml.
 
 Set-StrictMode -Version Latest
