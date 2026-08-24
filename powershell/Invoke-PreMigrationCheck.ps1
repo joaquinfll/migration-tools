@@ -31,6 +31,8 @@ if (-not (Test-Administrator)) {
     exit 1
 }
 
+Assert-MigrationPlatform -Expected VMware
+
 $results = @()
 
 Write-MigrationInfo (Get-WindowsOsCaption)

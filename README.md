@@ -1,7 +1,7 @@
 # Migration Pre/Post Checks — Playbook Reference
 
 Standalone Ansible playbooks for **Linux and Windows** VM migration from **VMware vSphere** to **KVM / OpenShift Virtualization**.
-All playbooks follow the same pattern: every check runs with `ignore_errors: true`, failures are collected into a single list, and a consolidated report is printed at the end before the play hard-fails.
+Each playbook validates the target hypervisor immediately after fact gathering — this **platform guard** hard-fails the play if run on the wrong platform. All other checks use `ignore_errors: true`, failures are collected into a single list, and a consolidated report is printed at the end before the play hard-fails.
 
 ---
 
@@ -193,6 +193,7 @@ Run **before** virt-v2v conversion while the VM is still on VMware vSphere.
 | Task | Description |
 |------|-------------|
 | Gather Facts | Collects OS and hardware facts via `ansible.builtin.setup` |
+| Assert VM is running on VMware | **Platform guard** — hard-fails immediately if `VMware` is not present in `product_name` |
 | Gather Packages | Collects installed package list via `package_facts` |
 | Gather Services | Collects systemd service states via `service_facts` |
 | INFO OS | Logs distribution name and version |
@@ -203,7 +204,6 @@ Run **before** virt-v2v conversion while the VM is still on VMware vSphere.
 |-------|-------------|
 | Check Root Filesystem Is Not BTRFS | Fails if the root (`/`) mount point uses the btrfs filesystem |
 | Check No BTRFS Filesystems Mounted | Fails if any mounted filesystem uses btrfs |
-| Valid Platform | Fails if `VMware` is not present in `product_name` — confirms VM is on vSphere |
 | Check open-vm-tools daemon is running | Fails if neither `open-vm-tools.service` nor `vmtoolsd.service` is in running state |
 | Check GRUB configs use UUID for root disk | Fails if any grub.cfg file references `/dev/sd*`, `/dev/vd*`, or `/dev/xvd*` instead of UUID |
 | Check fstab uses UUIDs for mount points | Fails if `/etc/fstab` has non-commented entries using `/dev/sd*` device paths |
@@ -322,6 +322,7 @@ Run **after** virt-v2v conversion once the VM has booted on KVM / OpenShift Virt
 | Task | Description |
 |------|-------------|
 | Gather Facts | Collects OS and hardware facts via `ansible.builtin.setup` |
+| Assert VM is running on KVM (not VMware) | **Platform guard** — hard-fails immediately if `VMware` is still present in `product_name` |
 | Gather Packages | Collects installed package list via `package_facts` |
 | Gather Services | Collects systemd service states via `service_facts` |
 | INFO OS | Logs distribution, version, and kernel |
@@ -330,7 +331,6 @@ Run **after** virt-v2v conversion once the VM has booted on KVM / OpenShift Virt
 
 | Check | Description |
 |-------|-------------|
-| Check platform is KVM (not VMware) | Fails if `VMware` is still present in `product_name` — confirms VM is no longer on vSphere |
 | Check VMware kernel modules are not loaded | Fails if any VMware kernel module (vmxnet, pvscsi, vmmemctl, vmci, vmw_vsock, vmw_balloon) is still loaded |
 | Check virtio_blk or virtio_scsi driver is loaded | Fails if neither `virtio_blk` nor `virtio_scsi` is loaded — VM cannot access its disk |
 | Check virtio_net driver is loaded | Fails if `virtio_net` is not loaded — VM has no functional network driver |
@@ -406,6 +406,7 @@ Requires WinRM access and the `ansible.windows` collection.
 | Task | Description |
 |------|-------------|
 | Gather Facts | Collects OS and hardware facts via `ansible.builtin.setup` |
+| Assert VM is running on VMware | **Platform guard** — hard-fails immediately if `VMware` is not present in `system_vendor` |
 | Gather Services | Collects Windows service states via `ansible.builtin.service_facts` |
 | INFO OS | Logs Windows edition and version number |
 
@@ -465,6 +466,7 @@ Requires WinRM access and the `ansible.windows` collection.
 | Task | Description |
 |------|-------------|
 | Gather Facts | Collects OS and hardware facts via `ansible.builtin.setup` |
+| Assert VM is running on KVM (not VMware) | **Platform guard** — hard-fails immediately if `VMware` is still present in `system_vendor` |
 | Gather Services | Collects Windows service states via `ansible.builtin.service_facts` |
 | INFO OS | Logs Windows edition, version, and kernel build |
 
@@ -472,7 +474,6 @@ Requires WinRM access and the `ansible.windows` collection.
 
 | Check | Description |
 |-------|-------------|
-| Check platform is KVM (not VMware) | Fails if `Win32_ComputerSystem.Manufacturer` still contains `VMware` — VM is not running on KVM |
 | Check VMware PVSCSI and VMXNET drivers are not active | Fails if VMware storage or network drivers are still bound — incomplete or failed conversion |
 | Check virtio-net (NetKVM) driver is active | Fails if no Red Hat VirtIO network adapter is detected — VM has no functional virtio NIC |
 | Check virtio storage driver is active | Fails if VirtIO SCSI or Block storage driver is not found — VM cannot access its disk via virtio |
@@ -513,7 +514,6 @@ Requires WinRM access and the `ansible.windows` collection.
 
 | Task | Description |
 |------|-------------|
-| INFO Detected platform | Logs `Win32_ComputerSystem.Manufacturer` |
 | INFO NIC driver details | Logs each adapter name, description, and link state |
 | INFO Disk details | Logs each disk number, size, and partition style |
 | INFO C drive usage | Logs used and free space on the C: volume |

@@ -76,6 +76,34 @@ function Test-Administrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Assert-MigrationPlatform {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('VMware', 'KVM')]
+        [string]$Expected
+    )
+
+    $manufacturer = (Get-CimInstance -ClassName Win32_ComputerSystem).Manufacturer
+    $isVmware = $manufacturer -match 'VMware'
+
+    if ($Expected -eq 'VMware' -and -not $isVmware) {
+        Write-Error @"
+Pre-migration checks are meant to be run on machines still running on VMware vSphere.
+Detected platform: $manufacturer.
+"@
+        exit 1
+    }
+
+    if ($Expected -eq 'KVM' -and $isVmware) {
+        Write-Error @"
+Post-migration checks are meant to be run on machines running on KVM/OpenShift Virtualization.
+Detected platform: $manufacturer (still VMware).
+"@
+        exit 1
+    }
+}
+
 function Get-WindowsNtVersion {
     $os = Get-CimInstance -ClassName Win32_OperatingSystem
     return [Version]$os.Version
@@ -200,6 +228,7 @@ Export-ModuleMember -Function @(
     'Write-MigrationInfo'
     'Write-MigrationWarning'
     'Test-Administrator'
+    'Assert-MigrationPlatform'
     'Get-WindowsNtVersion'
     'Get-WindowsOsCaption'
     'Get-RunningServiceName'

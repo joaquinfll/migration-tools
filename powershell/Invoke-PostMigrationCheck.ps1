@@ -37,18 +37,11 @@ if (-not (Test-Administrator)) {
     exit 1
 }
 
+Assert-MigrationPlatform -Expected KVM
+
 $results = @()
 
 Write-MigrationInfo (Get-WindowsOsCaption)
-
-# ============ CRITICAL: Platform must be KVM, not VMware ============
-
-$manufacturer = (Get-CimInstance -ClassName Win32_ComputerSystem).Manufacturer
-Write-MigrationInfo "Platform manufacturer: $manufacturer"
-
-$results += Build-MigrationCheckResult -Severity CRITICAL -Name 'Platform (still VMware)' -Passed (
-    $manufacturer -notmatch 'VMware'
-) -Message 'Win32_ComputerSystem.Manufacturer still contains VMware — VM is not running on KVM'
 
 # ============ CRITICAL: VMware drivers must be absent ============
 

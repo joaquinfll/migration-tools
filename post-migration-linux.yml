@@ -10,6 +10,14 @@
     - name: Gather Facts
       ansible.builtin.setup:
 
+    - name: Assert VM is running on KVM (not VMware)
+      ansible.builtin.assert:
+        that:
+          - "'VMware' not in ansible_facts['product_name']"
+        fail_msg: >-
+          Post-migration checks are meant to be run on machines running on KVM/OpenShift Virtualization.
+          Detected platform: {{ ansible_facts['product_name'] }} (still VMware).
+
     - name: Gather Packages
       ansible.builtin.package_facts:
         manager: auto
@@ -34,15 +42,7 @@
           Preflight OK — Ansible {{ ansible_version.full }},
           {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}
 
-    # ============ CRITICAL: Platform must be KVM, not VMware ============
-    # The single most important check — confirms the VM is no longer running on VMware.
-
-    - name: Check platform is KVM (not VMware)
-      ansible.builtin.debug:
-        msg: "Running in {{ ansible_facts['product_name'] }}"
-      failed_when: "'VMware' in ansible_facts['product_name']"
-      ignore_errors: true
-      register: platform_check
+    # ============ INFO: Hypervisor detection ============
 
     - name: INFO Hypervisor
       ansible.builtin.shell: |
@@ -481,7 +481,6 @@
         failed_check_list: >-
           {{
             [
-              {'label': '[CRITICAL] Platform (still VMware)', 'msg': 'VM product_name still contains VMware — not running on KVM'} if platform_check is defined and 'failed' in platform_check and platform_check.failed else None,
               {'label': '[CRITICAL] VMware kernel modules', 'msg': 'VMware kernel modules still loaded: ' + vmware_modules_check.stdout} if vmware_modules_check is defined and 'failed' in vmware_modules_check and vmware_modules_check.failed else None,
               {'label': '[CRITICAL] virtio_blk/scsi', 'msg': 'virtio_blk or virtio_scsi driver is not loaded'} if virtio_blk_check is defined and 'failed' in virtio_blk_check and virtio_blk_check.failed else None,
               {'label': '[CRITICAL] virtio_net', 'msg': 'virtio_net driver is not loaded'} if virtio_net_check is defined and 'failed' in virtio_net_check and virtio_net_check.failed else None,

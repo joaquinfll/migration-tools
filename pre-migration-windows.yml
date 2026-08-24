@@ -11,6 +11,14 @@
     - name: Gather Facts
       ansible.builtin.setup:
 
+    - name: Assert VM is running on VMware
+      ansible.builtin.assert:
+        that:
+          - "'VMware' in ansible_facts['system_vendor']"
+        fail_msg: >-
+          Pre-migration checks are meant to be run on machines still running on VMware vSphere.
+          Detected platform: {{ ansible_facts['system_vendor'] }}.
+
     - name: Gather Services
       ansible.builtin.service_facts:
 

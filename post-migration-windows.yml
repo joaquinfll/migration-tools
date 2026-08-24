@@ -12,6 +12,14 @@
     - name: Gather Facts
       ansible.builtin.setup:
 
+    - name: Assert VM is running on KVM (not VMware)
+      ansible.builtin.assert:
+        that:
+          - "'VMware' not in ansible_facts['system_vendor']"
+        fail_msg: >-
+          Post-migration checks are meant to be run on machines running on KVM/OpenShift Virtualization.
+          Detected platform: {{ ansible_facts['system_vendor'] }} (still VMware).
+
     - name: Gather Services
       ansible.builtin.service_facts:
 
@@ -31,21 +39,6 @@
         success_msg: >-
           Preflight OK — Ansible {{ ansible_version.full }},
           {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}
-
-    # ============ CRITICAL: Platform must be KVM, not VMware ============
-    # The single most important check — confirms the VM is no longer on VMware.
-
-    - name: Check platform is KVM (not VMware)
-      ansible.windows.win_shell: |
-        (Get-WmiObject Win32_ComputerSystem).Manufacturer
-      changed_when: false
-      ignore_errors: true
-      register: platform_win_check
-      failed_when: "'VMware' in platform_win_check.stdout"
-
-    - name: INFO Detected platform
-      ansible.builtin.debug:
-        msg: "Platform manufacturer: {{ platform_win_check.stdout | trim }}"
 
     # ============ CRITICAL: VMware kernel modules must be absent ============
     # Any active VMware drivers indicate an incomplete or failed conversion.
@@ -407,7 +400,6 @@
         failed_check_list: >-
           {{
             [
-              {'label': '[CRITICAL] Platform (still VMware)', 'msg': 'Win32_ComputerSystem.Manufacturer still contains VMware — VM is not running on KVM'} if platform_win_check is defined and 'failed' in platform_win_check and platform_win_check.failed else None,
               {'label': '[CRITICAL] VMware drivers active', 'msg': 'VMware PVSCSI/VMXNET drivers still active: ' + (vmware_drivers_post_check.stdout | trim)} if vmware_drivers_post_check is defined and 'failed' in vmware_drivers_post_check and vmware_drivers_post_check.failed else None,
               {'label': '[CRITICAL] virtio-net (NetKVM)', 'msg': 'No Red Hat VirtIO network adapter found — VM has no virtio NIC'} if virtio_net_win_check is defined and 'failed' in virtio_net_win_check and virtio_net_win_check.failed else None,
               {'label': '[CRITICAL] virtio storage driver', 'msg': 'VirtIO SCSI or Block storage driver not found — VM cannot access disk via virtio'} if virtio_storage_win_check is defined and 'failed' in virtio_storage_win_check and virtio_storage_win_check.failed else None,

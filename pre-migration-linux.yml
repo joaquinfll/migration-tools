@@ -9,6 +9,14 @@
     - name: Gather Facts
       ansible.builtin.setup:
 
+    - name: Assert VM is running on VMware
+      ansible.builtin.assert:
+        that:
+          - "'VMware' in ansible_facts['product_name']"
+        fail_msg: >-
+          Pre-migration checks are meant to be run on machines still running on VMware vSphere.
+          Detected platform: {{ ansible_facts['product_name'] }}.
+
     - name: Gather Packages
       ansible.builtin.package_facts:
         manager: auto
@@ -55,15 +63,6 @@
       loop_control:
         label: "{{ item.mount }} ({{ item.fstype }})"
       when: item.fstype == 'btrfs'
-
-    # Failsafe for any OS: ensure the VM is in vCenter
-    - name: Valid Platform
-      ansible.builtin.debug:
-        msg: "Running in {{ ansible_facts['product_name'] }}"
-      ignore_errors: true
-      failed_when: "'VMware' not in ansible_facts['product_name']"
-      changed_when: false
-      register: valid_platform_check
 
     # The package is named the same across distros
     - name: OS VMware Tools
@@ -992,7 +991,6 @@
         failed_check_list: >-
           {{
             [
-              {'label': '[CRITICAL] Valid Platform', 'msg': 'VM is not running on VMware vSphere'} if valid_platform_check is defined and 'failed' in valid_platform_check and valid_platform_check.failed else None,
               {'label': '[CRITICAL] open-vm-tools package', 'msg': 'open-vm-tools is not installed'} if os_vmware_tools_check is defined and 'failed' in os_vmware_tools_check and os_vmware_tools_check.failed else None,
               {'label': '[HIGH] ubuntu-minimal package', 'msg': 'ubuntu-minimal package is not installed'} if ubuntu_minimal_check is defined and 'failed' in ubuntu_minimal_check and ubuntu_minimal_check.failed else None,
               {'label': '[CRITICAL] BTRFS root', 'msg': 'Root filesystem is btrfs'} if check_btrfs_root is defined and 'failed' in check_btrfs_root and check_btrfs_root.failed else None,
