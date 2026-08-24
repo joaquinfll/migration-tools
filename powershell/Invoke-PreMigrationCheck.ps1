@@ -94,6 +94,7 @@ try {
     $secureBootState = $(if (Confirm-SecureBootUEFI -ErrorAction Stop) { 'enabled' } else { 'disabled' })
 } catch [System.PlatformNotSupportedException] {
 } catch [System.UnauthorizedAccessException] {
+} catch {
 }
 
 $results += New-MigrationCheckResult -Severity CRITICAL -Name 'Secure Boot' -Passed (
@@ -225,8 +226,10 @@ $blocks = $vssOut -split '(?=Writer name:)'
 foreach ($block in $blocks) {
     $name = $(if ($block -match "Writer name:\s*'?(.+?)'?\r?\n") { $Matches[1].Trim() } else { $null })
     $err = $(if ($block -match 'Last error:\s*(.+?)\r?\n') { $Matches[1].Trim() } else { $null })
-    if ($name -and $err -and $err -notmatch '^No error') {
-        $vssBad += "$name ($err)"
+    $state = $(if ($block -match 'State:\s*\[\d+\]\s*(.+?)\r?\n') { $Matches[1].Trim() } else { $null })
+    if (-not $name) { continue }
+    if (($err -and $err -notmatch '^No error') -or ($state -and $state -ne 'Stable')) {
+        $vssBad += "$name (State: $state, Last error: $err)"
     }
 }
 $vssBadDetail = $vssBad -join '; '

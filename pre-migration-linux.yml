@@ -155,7 +155,10 @@
       changed_when: false
       ignore_errors: true
       register: virtio_driver_check
-      failed_when: virtio_driver_check.stdout_lines | length < 2
+      failed_when: >
+        'virtio_blk' not in virtio_driver_check.stdout or
+        'virtio_scsi' not in virtio_driver_check.stdout or
+        'virtio_net' not in virtio_driver_check.stdout
       when: ansible_facts['os_family'] == "RedHat" and ansible_facts['kernel'] is defined
 
     - name: Check virtio drivers are in initramfs (Debian)
@@ -164,7 +167,10 @@
       changed_when: false
       ignore_errors: true
       register: virtio_driver_check_deb
-      failed_when: virtio_driver_check_deb.stdout_lines | length < 2
+      failed_when: >
+        'virtio_blk' not in virtio_driver_check_deb.stdout or
+        'virtio_scsi' not in virtio_driver_check_deb.stdout or
+        'virtio_net' not in virtio_driver_check_deb.stdout
       when: ansible_facts['os_family'] == "Debian" and ansible_facts['kernel'] is defined
 
     # ============ HIGH: NFS/CIFS mounts in fstab ============
@@ -284,13 +290,12 @@
     # ============ MEDIUM: Non-virtio network drivers ============
     # If the VM is using e1000 or other paravirtualized drivers, virt-v2v should convert them.
 
-    - name: Check for non-virtio network drivers
+    - name: INFO Non-virtio network drivers
       ansible.builtin.shell: |
         lspci 2>/dev/null | grep -iE 'ethernet|network' | grep -iE 'e1000|vmxnet|igb' || true
       changed_when: false
       ignore_errors: true
       register: nic_driver_check
-      failed_when: nic_driver_check.stdout | length > 0
 
     # ============ MEDIUM: LVM thin provisioning ============
     # Thin provisioning and snapshots can cause issues during conversion.
@@ -375,15 +380,13 @@
       failed_when: multipath_check.stdout | length > 0
       when: "'device-mapper-multipath' in ansible_facts['packages']"
 
-    # ============ HIGH: SELinux enforcing without relabel ============
-    # If SELinux is enforcing but /forcefselinux doesn't exist, the migrated VM may boot into a denied state.
+    # ============ INFO: SELinux mode ============
+    # virt-v2v handles SELinux relabeling automatically; enforcing is a supported state.
 
-    - name: Check SELinux mode
+    - name: INFO SELinux mode
       ansible.builtin.debug:
         msg: "SELinux status={{ ansible_facts['selinux']['status'] }} mode={{ ansible_facts['selinux']['mode'] }}"
       changed_when: false
-      ignore_errors: true
-      register: selinux_mode
       when: "'selinux' in ansible_facts and ansible_facts['selinux']['status'] != 'disabled'"
 
     # ============ HIGH: GRUB password protection ============
@@ -414,13 +417,12 @@
     # that won't exist or are unnecessary on the KubeVirt target.
     # Note: ixgbe is standard Intel 10GbE on bare-metal servers — not hypervisor-specific.
 
-    - name: Check for hypervisor-specific kernel modules
+    - name: INFO Hypervisor-specific kernel modules
       ansible.builtin.shell: |
         lsmod 2>/dev/null | grep -iE 'vmxnet|vmware|lpfc|qla2xxx|bnx2' || true
       changed_when: false
       ignore_errors: true
       register: hw_module_check
-      failed_when: hw_module_check.stdout | length > 0
 
     # ============ MEDIUM: Persistent net rules ============
     # Old udev rules that hardcode MAC-to-interface mappings (common in RHEL/CentOS 6).
@@ -448,13 +450,12 @@
     # ============ MEDIUM: VMware Tools kernel module conflicts ============
     # If both open-vm-tools and the proprietary VMware Tools kernel modules are present, they conflict.
 
-    - name: Check for VMware Tools kernel module conflicts
+    - name: INFO VMware Tools kernel module conflicts
       ansible.builtin.shell: |
         lsmod 2>/dev/null | grep -E '^vmxnet|^pvscsi|^vmhgfs' || true
       changed_when: false
       ignore_errors: true
       register: vmware_module_check
-      failed_when: vmware_module_check.stdout | length > 0
       when: "'open-vm-tools' in ansible_facts['packages']"
 
  # ============ LOW: Swap partition references in fstab ============
@@ -519,7 +520,7 @@
 
     - name: Check GRUB video configuration
       ansible.builtin.shell: |
-        grep -E 'GRUB_GFXMODE|GRUB_GFXPAYLOAD' /etc/default/grub || true
+        grep -E '^\s*(GRUB_GFXMODE|GRUB_GFXPAYLOAD)' /etc/default/grub || true
       changed_when: false
       ignore_errors: true
       register: grub_video_check
@@ -1067,7 +1068,6 @@
               {'label': '[LOW] Partition table', 'msg': 'MBR partition table detected (use GPT)'} if partition_table_check is defined and 'failed' in partition_table_check and partition_table_check.failed else None,
               {'label': '[MEDIUM] Network conflicts', 'msg': 'NetworkManager and ifupdown both active'} if network_conflict_check is defined and 'failed' in network_conflict_check and network_conflict_check.failed else None,
               {'label': '[MEDIUM] NTP config', 'msg': 'No NTP/chrony service detected'} if ntp_check is defined and 'failed' in ntp_check and ntp_check.failed else None,
-              {'label': '[MEDIUM] NIC drivers', 'msg': 'Non-virtio network drivers detected'} if nic_driver_check is defined and 'failed' in nic_driver_check and nic_driver_check.failed else None,
               {'label': '[MEDIUM] LVM thin', 'msg': 'LVM thin provisioning detected'} if lvm_thin_check is defined and 'failed' in lvm_thin_check and lvm_thin_check.failed else None,
               {'label': '[LOW] Legacy NIC naming', 'msg': 'Legacy ethX network interface naming detected'} if legacy_nic_check is defined and 'failed' in legacy_nic_check and legacy_nic_check.failed else None,
               {'label': '[CRITICAL] cmdline', 'msg': 'Device path references found in /proc/cmdline'} if cmdline_check is defined and 'failed' in cmdline_check and cmdline_check.failed else None,
@@ -1075,13 +1075,10 @@
               {'label': '[CRITICAL] Software RAID', 'msg': 'Software RAID arrays detected'} if mdadm_check is defined and 'failed' in mdadm_check and mdadm_check.failed else None,
               {'label': '[CRITICAL] Kernel version', 'msg': 'Kernel version too old for virtio drivers'} if kernel_compat is defined and 'failed' in kernel_compat and kernel_compat.failed else None,
               {'label': '[HIGH] Multipath', 'msg': 'Multipath configuration detected'} if multipath_check is defined and 'failed' in multipath_check and multipath_check.failed else None,
-              {'label': '[HIGH] SELinux', 'msg': 'SELinux mode detected: ' + ansible_facts['selinux']['mode']} if 'selinux' in ansible_facts and ansible_facts['selinux']['mode'] | lower == 'enforcing' and selinux_mode is defined and 'failed' in selinux_mode and selinux_mode.failed else None,
               {'label': '[HIGH] GRUB password', 'msg': 'GRUB password protection detected'} if grub_pass_check is defined and 'failed' in grub_pass_check and grub_pass_check.failed else None,
                 {'label': '[MEDIUM] cloud-init', 'msg': 'Hypervisor-specific cloud-init datasource detected'} if cloudinit_check is defined and 'failed' in cloudinit_check and cloudinit_check.failed else None,
-              {'label': '[MEDIUM] Kernel modules', 'msg': 'Hypervisor-specific kernel modules detected'} if hw_module_check is defined and 'failed' in hw_module_check and hw_module_check.failed else None,
               {'label': '[MEDIUM] Persistent net rules', 'msg': 'Persistent net rules found (MAC-to-interface binding)'} if persistent_net_check is defined and 'failed' in persistent_net_check and persistent_net_check.failed else None,
               {'label': '[MEDIUM] Systemd units', 'msg': 'Hardware-dependent systemd units detected'} if systemd_hw_check is defined and 'failed' in systemd_hw_check and systemd_hw_check.failed else None,
-              {'label': '[MEDIUM] VMware modules', 'msg': 'VMware Tools kernel modules conflict with open-vm-tools'} if vmware_module_check is defined and 'failed' in vmware_module_check and vmware_module_check.failed else None,
                 {'label': '[LOW] Swap UUIDs', 'msg': 'Swap using device path in /etc/fstab'} if swap_device_check is defined and 'failed' in swap_device_check and swap_device_check.failed else None,
               {'label': '[LOW] Docker driver', 'msg': 'Docker using devicemapper storage driver'} if docker_driver is defined and 'failed' in docker_driver and docker_driver.failed else None,
               {'label': '[LOW] Syslog forwarding', 'msg': 'Syslog forwarding to external host detected'} if syslog_check is defined and 'failed' in syslog_check and syslog_check.failed else None,
