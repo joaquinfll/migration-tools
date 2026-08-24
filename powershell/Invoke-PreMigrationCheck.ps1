@@ -31,7 +31,12 @@ if (-not (Test-Administrator)) {
     exit 1
 }
 
-Assert-MigrationPlatform -Expected VMware
+try {
+    Assert-MigrationPlatform -Expected VMware
+} catch {
+    Write-Error $_
+    exit 1
+}
 
 $results = @()
 
@@ -56,9 +61,9 @@ $results += New-MigrationCheckResult -Severity CRITICAL -Name 'BitLocker' -Passe
 
 $dynamicDisks = @(Get-Disk -ErrorAction SilentlyContinue |
     Where-Object { $_.PartitionStyle -eq 'Dynamic' })
-$dynamicDetail = if ($dynamicDisks) {
+$dynamicDetail = $(if ($dynamicDisks) {
     'Disk(s): ' + (($dynamicDisks.Number | ForEach-Object { $_.ToString() }) -join ', ')
-} else { '' }
+} else { '' })
 
 $results += New-MigrationCheckResult -Severity CRITICAL -Name 'Dynamic disks' -Passed (
     $dynamicDisks.Count -eq 0
@@ -84,10 +89,11 @@ $results += New-MigrationCheckResult -Severity CRITICAL -Name 'Windows version' 
 
 # ============ CRITICAL: Secure Boot ============
 
-$secureBootState = try {
-    if (Confirm-SecureBootUEFI -ErrorAction Stop) { 'enabled' } else { 'disabled' }
-} catch {
-    'unavailable'
+$secureBootState = 'unavailable'
+try {
+    $secureBootState = $(if (Confirm-SecureBootUEFI -ErrorAction Stop) { 'enabled' } else { 'disabled' })
+} catch [System.PlatformNotSupportedException] {
+} catch [System.UnauthorizedAccessException] {
 }
 
 $results += New-MigrationCheckResult -Severity CRITICAL -Name 'Secure Boot' -Passed (
@@ -100,11 +106,13 @@ $rebootPending = $false
 $rebootKeys = @(
     'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
     'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
-    'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\PendingFileRenameOperations'
 )
 foreach ($key in $rebootKeys) {
     if (Test-Path $key) { $rebootPending = $true }
 }
+$pfro = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' `
+    -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
+if ($pfro) { $rebootPending = $true }
 
 $results += New-MigrationCheckResult -Severity CRITICAL -Name 'Pending reboot' -Passed (-not $rebootPending) `
     -Message 'System has a pending reboot — resolve before migration to avoid inconsistent disk state'
@@ -113,7 +121,7 @@ $results += New-MigrationCheckResult -Severity CRITICAL -Name 'Pending reboot' -
 
 $bcdOutput = bcdedit /enum all 2>&1 | Out-String
 $bcdFailed = $LASTEXITCODE -ne 0
-$bcdDetail = if ($bcdFailed) { "BCD error: $bcdOutput" } else { '' }
+$bcdDetail = $(if ($bcdFailed) { "BCD error: $bcdOutput" } else { '' })
 
 $results += New-MigrationCheckResult -Severity CRITICAL -Name 'BCD store' -Passed (-not $bcdFailed) `
     -Message 'BCD store integrity check failed — boot configuration may be corrupt' -Detail $bcdDetail
@@ -134,19 +142,19 @@ $results += New-MigrationCheckResult -Severity HIGH -Name 'VMware Tools service'
 $vmwareDrivers = @(Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction SilentlyContinue |
     Where-Object { $_.DeviceName -match 'VMware' } |
     Select-Object -ExpandProperty DeviceName -Unique)
-$driverText = if ($vmwareDrivers) { $vmwareDrivers -join ', ' } else { 'none' }
+$driverText = $(if ($vmwareDrivers) { $vmwareDrivers -join ', ' } else { 'none' })
 Write-MigrationInfo "VMware drivers present: $driverText"
 
 # ============ HIGH: Windows activation type (informational) ============
 
 $activationResult = cscript //NoLogo "$env:SystemRoot\system32\slmgr.vbs" /dli 2>&1 | Out-String
-$activationType = if ($activationResult -match 'KMS') {
+$activationType = $(if ($activationResult -match 'KMS') {
     'KMS'
 } elseif ($activationResult -match 'MAK|Retail|OEM') {
     'MAK/Retail/OEM'
 } else {
     'Unknown'
-}
+})
 
 if ($activationType -eq 'KMS') {
     Write-MigrationInfo "Activation type: KMS — KMS will require re-activation after migration (hypervisor UUID changes)"
@@ -174,7 +182,7 @@ $results += New-MigrationCheckResult -Severity HIGH -Name 'Horizon/VDI agent' -P
 
 # ============ HIGH: EDR / AV agent detection ============
 
-$edrRunning = @(Get-ServiceRunningNames -ServiceNames (Get-EdrServiceNames))
+$edrRunning = @(Get-RunningServiceName -ServiceNames (Get-EdrServiceName))
 $edrDetail = $edrRunning -join ', '
 
 $results += New-MigrationCheckResult -Severity HIGH -Name 'EDR/AV agent' -Passed (
@@ -183,7 +191,7 @@ $results += New-MigrationCheckResult -Severity HIGH -Name 'EDR/AV agent' -Passed
 
 # ============ HIGH: Running databases ============
 
-$dbRunning = @(Get-ServiceRunningNames -ServiceNames (Get-PreMigrationDatabaseServiceNames))
+$dbRunning = @(Get-RunningServiceName -ServiceNames (Get-PreMigrationDatabaseServiceName))
 $dbDetail = $dbRunning -join ', '
 if ($dbRunning.Count -gt 0) {
     Write-MigrationInfo "Database service(s) running: $dbDetail"
@@ -196,7 +204,7 @@ $results += New-MigrationCheckResult -Severity HIGH -Name 'Running databases' -P
 # ============ HIGH: C: drive free space ============
 
 $cDrive = Get-PSDrive -Name C -ErrorAction SilentlyContinue
-$cFreeGb = if ($cDrive) { [math]::Round($cDrive.Free / 1GB, 2) } else { 0 }
+$cFreeGb = $(if ($cDrive) { [math]::Round($cDrive.Free / 1GB, 2) } else { 0 })
 Write-MigrationInfo "C: free space: $cFreeGb GB"
 
 $results += New-MigrationCheckResult -Severity HIGH -Name 'C: drive space' -Passed (
@@ -215,14 +223,11 @@ $vssOut = vssadmin list writers 2>&1 | Out-String
 $vssBad = @()
 $blocks = $vssOut -split '(?=Writer name:)'
 foreach ($block in $blocks) {
-    $name = if ($block -match "Writer name:\s*'?(.+?)'?\r?\n") { $Matches[1].Trim() } else { $null }
-    $err = if ($block -match 'Last error:\s*(.+?)\r?\n') { $Matches[1].Trim() } else { $null }
+    $name = $(if ($block -match "Writer name:\s*'?(.+?)'?\r?\n") { $Matches[1].Trim() } else { $null })
+    $err = $(if ($block -match 'Last error:\s*(.+?)\r?\n') { $Matches[1].Trim() } else { $null })
     if ($name -and $err -and $err -notmatch '^No error') {
         $vssBad += "$name ($err)"
     }
-}
-if ($vssOut -match '\[(7|8|9|11)\]') {
-    $vssBad += 'non-stable state code detected'
 }
 $vssBadDetail = $vssBad -join '; '
 
@@ -273,9 +278,9 @@ if ($staticIpText) {
 
 $mbrDisks = @(Get-Disk -ErrorAction SilentlyContinue |
     Where-Object { $_.PartitionStyle -eq 'MBR' })
-$mbrDetail = if ($mbrDisks) {
+$mbrDetail = $(if ($mbrDisks) {
     'MBR disks: ' + (($mbrDisks.Number | ForEach-Object { $_.ToString() }) -join ', ')
-} else { '' }
+} else { '' })
 
 $results += New-MigrationCheckResult -Severity MEDIUM -Name 'Partition table (MBR)' -Passed (
     $mbrDisks.Count -eq 0
@@ -305,7 +310,7 @@ if ($computerSystem.PartOfDomain) {
 # ============ MEDIUM: Page file configuration (informational) ============
 
 $pageFiles = @(Get-CimInstance -ClassName Win32_PageFileSetting -ErrorAction SilentlyContinue)
-$pageFileText = if ($pageFiles) { ($pageFiles | ForEach-Object { $_.Name }) -join ', ' } else { 'System managed' }
+$pageFileText = $(if ($pageFiles) { ($pageFiles | ForEach-Object { $_.Name }) -join ', ' } else { 'System managed' })
 Write-MigrationInfo "Page file(s): $pageFileText"
 
 # ============ LOW: RDP enabled ============
@@ -318,7 +323,7 @@ $results += New-MigrationCheckResult -Severity LOW -Name 'RDP disabled' -Passed 
 
 # ============ INFO: VMware registry keys ============
 
-$vmwareRegistry = if (Test-Path 'HKLM:\SOFTWARE\VMware, Inc.') { 'found' } else { 'absent' }
+$vmwareRegistry = $(if (Test-Path 'HKLM:\SOFTWARE\VMware, Inc.') { 'found' } else { 'absent' })
 Write-MigrationInfo "VMware registry keys (HKLM:\SOFTWARE\VMware, Inc.): $vmwareRegistry"
 
 # ============ INFO: Disk inventory ============
@@ -332,7 +337,7 @@ if ($diskLines) {
 
 # ============ INFO: NIC inventory ============
 
-$nicLines = @(Get-NicInventoryLines)
+$nicLines = @(Get-NicInventory)
 Write-MigrationInfo "NICs (excluding loopback): $($nicLines.Count)"
 if ($nicLines) {
     Write-MigrationInfo "NIC details:`n$($nicLines -join "`n")"

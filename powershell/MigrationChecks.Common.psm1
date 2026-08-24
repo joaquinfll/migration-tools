@@ -22,7 +22,7 @@ $Script:PreMigrationDatabaseServices = @(
     'MongoDB'
 )
 
-function Build-MigrationCheckResult {
+function New-MigrationCheckResult {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -45,7 +45,7 @@ function Build-MigrationCheckResult {
         Label    = "[$Severity] $Name"
         Name     = $Name
         Passed   = $Passed
-        Message  = if ($Message) { $Message } else { $Name }
+        Message  = $(if ($Message) { $Message } else { $Name })
         Detail   = $Detail
     }
 }
@@ -84,23 +84,26 @@ function Assert-MigrationPlatform {
         [string]$Expected
     )
 
-    $manufacturer = (Get-CimInstance -ClassName Win32_ComputerSystem).Manufacturer
+    try {
+        $manufacturer = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).Manufacturer
+    } catch {
+        throw "Cannot determine platform: failed to query Win32_ComputerSystem. $_"
+    }
+
     $isVmware = $manufacturer -match 'VMware'
 
     if ($Expected -eq 'VMware' -and -not $isVmware) {
-        Write-Error @"
+        throw @"
 Pre-migration checks are meant to be run on machines still running on VMware vSphere.
 Detected platform: $manufacturer.
 "@
-        exit 1
     }
 
     if ($Expected -eq 'KVM' -and $isVmware) {
-        Write-Error @"
+        throw @"
 Post-migration checks are meant to be run on machines running on KVM/OpenShift Virtualization.
 Detected platform: $manufacturer (still VMware).
 "@
-        exit 1
     }
 }
 
@@ -156,7 +159,7 @@ function Get-NicInventory {
             Where-Object { $_.PrefixOrigin -ne 'WellKnown' } |
             Select-Object -First 1 -ExpandProperty IPAddress
 
-        $ipText = if ($ip) { $ip } else { 'no-ip' }
+        $ipText = $(if ($ip) { $ip } else { 'no-ip' })
         $lines += "$($nic.Name): mac=$($nic.MacAddress) ip=$ipText mtu=$($nic.ActiveMaximumTransmissionUnit) [$($nic.InterfaceDescription)]"
     }
 
@@ -224,7 +227,7 @@ function Get-PreMigrationDatabaseServiceName {
 }
 
 Export-ModuleMember -Function @(
-    'Build-MigrationCheckResult'
+    'New-MigrationCheckResult'
     'Write-MigrationInfo'
     'Write-MigrationWarning'
     'Test-Administrator'
