@@ -97,9 +97,9 @@ try {
 } catch {
 }
 
-$results += New-MigrationCheckResult -Severity CRITICAL -Name 'Secure Boot' -Passed (
+$results += New-MigrationCheckResult -Severity LOW -Name 'Secure Boot' -Passed (
     $secureBootState -ne 'enabled'
-) -Message 'Secure Boot is enabled -- virtio drivers must be signed for the target platform'
+) -Message 'Secure Boot is enabled -- verify virtio drivers are signed for the target platform (MTV provides signed drivers)'
 
 # ============ CRITICAL: Pending reboot ============
 
