@@ -87,7 +87,7 @@ $results += New-MigrationCheckResult -Severity CRITICAL -Name 'Windows version' 
     $ntVersion -ge [Version]'6.1'
 ) -Message 'Windows version is below minimum (6.1 / Windows 7 / Server 2008 R2) supported by virt-v2v'
 
-# ============ CRITICAL: Secure Boot ============
+# ============ LOW: Secure Boot ============
 
 $secureBootState = 'unavailable'
 try {

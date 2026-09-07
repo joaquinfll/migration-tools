@@ -202,42 +202,29 @@ Run **before** virt-v2v conversion while the VM is still on VMware vSphere.
 
 | Check | Description |
 |-------|-------------|
+| Check open-vm-tools package is installed | Fails if `open-vm-tools` package is not installed — virt-v2v needs it for clean driver removal |
+| Check open-vm-tools daemon is running | Fails if neither `open-vm-tools.service` nor `vmtoolsd.service` is in running state |
 | Check Root Filesystem Is Not BTRFS | Fails if the root (`/`) mount point uses the btrfs filesystem |
 | Check No BTRFS Filesystems Mounted | Fails if any mounted filesystem uses btrfs |
-| Check open-vm-tools daemon is running | Fails if neither `open-vm-tools.service` nor `vmtoolsd.service` is in running state |
 | Check GRUB configs use UUID for root disk | Fails if any grub.cfg file references `/dev/sd*`, `/dev/vd*`, or `/dev/xvd*` instead of UUID |
 | Check fstab uses UUIDs for mount points | Fails if `/etc/fstab` has non-commented entries using `/dev/sd*` device paths |
 | Check GRUB_CMDLINE_LINUX uses UUID | Fails if `/etc/default/grub` contains `root=/dev/sd*` in the kernel command line |
-| Check virtio drivers are in initramfs | Fails if `virtio_blk`, `virtio_scsi`, or `virtio_net` are missing from the RHEL initramfs image |
-| Check virtio drivers are in initramfs (Debian) | Fails if virtio drivers are missing from the Debian/Ubuntu initrd image |
 | Check running kernel cmdline uses UUID | Fails if `/proc/cmdline` shows the running kernel was booted with a `/dev/sd*` root device path |
 | Check for LUKS encrypted volumes | Fails if any block device has LUKS encryption — passphrase/keyfile availability must be confirmed |
 | Check for software RAID arrays | Fails if `/proc/mdstat` shows active mdadm RAID arrays that may desync on device rename |
 | Check kernel version is compatible | Fails if kernel version is below 3.10, the minimum for virtio driver support |
-| Check if system boots via UEFI | Detects UEFI vs BIOS boot mode by checking `/sys/firmware/efi` |
-| Check Secure Boot state | Fails if Secure Boot is enabled — virtio drivers must be signed for the target platform |
 | Check EFI System Partition is mounted and healthy | Fails if UEFI system's `/boot/efi` is not mounted as `vfat` |
 | Check for ZFS filesystems | Fails if ZFS is loaded or pools exist — virt-v2v cannot convert ZFS volumes |
-| Check VMware paravirtual SCSI (pvscsi) driver is loaded | Fails if `pvscsi` module is not loaded — inventories the storage adapter type |
-| Check VMware memory balloon (vmmemctl) driver is loaded | Fails if `vmmemctl` module is not loaded — inventories balloon driver presence |
-| Check VMware VMCI and vSock modules are loaded | Fails if `vmci` or `vmw_vsock_vmci_transport` modules are not loaded |
-| Check dracut is configured to include virtio modules | Fails if no dracut config references virtio — initramfs rebuilds will omit virtio drivers (RHEL only) |
 
 ### HIGH — Post-Migration Failures
 
 | Check | Description |
 |-------|-------------|
-| OS VMware Tools | Fails if `open-vm-tools` package is not installed |
 | Package ubuntu-minimal Is Present | Fails if `ubuntu-minimal` is absent on Ubuntu systems |
 | Check for NFS/CIFS mounts in fstab | Fails if fstab contains NFS or CIFS mounts that may not exist in the target environment |
 | Check for multipath configuration | Fails if multipath is active — WWID-based naming may break if disk topology changes |
-| Check SELinux mode | Reports current SELinux mode; warns if Enforcing without autorelabel |
 | Check for GRUB password protection | Fails if GRUB is password-protected — boot may fail if password is not preserved |
 | Check for VMware legacy tools daemon | Fails if `/usr/bin/vmware-toolsd` exists — conflicts with `open-vm-tools` |
-| Check SELinux autorelabel requirement | Warns if SELinux is Enforcing that `/.autorelabel` must be created before migration |
-| Check root filesystem free space | Fails if root filesystem has less than 1 GB free — virt-v2v needs space for conversion |
-| Check for hardcoded MAC addresses in ifcfg files | Fails if `HWADDR=` entries are found in RHEL network config — breaks after MAC change |
-| Check for hardcoded MAC addresses in Debian network config | Fails if `hwaddress` or `mac-address` entries found in Debian network config |
 | Check for immutable files | Fails if any file in `immutable_files_list` has the immutable attribute set |
 | Check for OverlayFS mounts | Fails if OverlayFS mounts are active — cannot be block-copied by virt-v2v |
 | Check FIPS mode | Fails if FIPS mode is enabled — initramfs rebuild may break the FIPS integrity chain |
@@ -246,6 +233,8 @@ Run **before** virt-v2v conversion while the VM is still on VMware vSphere.
 | Check for running database services | Fails if MySQL, MariaDB, PostgreSQL, Oracle, or MongoDB are running without a quiesce plan |
 | Check qemu-guest-agent is available in repos (RHEL) | Fails if `qemu-guest-agent` is not available in configured yum repositories |
 | Check qemu-guest-agent is available in repos (Debian) | Fails if `qemu-guest-agent` is not available in configured apt repositories |
+| Check for EDR or AV agent packages | Fails if EDR/AV packages are detected (CrowdStrike, Carbon Black, SentinelOne, etc.) — may block virt-v2v conversion and qemu-guest-agent install post-migration |
+| Check for EDR or AV agent services | Fails if EDR/AV services are running — add qemu-guest-agent to EDR allow-list before migrating |
 
 ### MEDIUM — Post-Migration Degradation
 
@@ -254,44 +243,42 @@ Run **before** virt-v2v conversion while the VM is still on VMware vSphere.
 | Check for bonding configurations | Fails if bond/slave network config is found (RHEL) — breaks after MAC address changes |
 | Check for bridge configurations | Fails if bridge config is found (Debian) — breaks after MAC address changes |
 | Check for hardware-specific udev rules | Fails if udev rules reference specific hardware IDs, MACs, or VMware/e1000 drivers |
-| Check partition table type | Fails if primary disk uses MBR partition table instead of GPT |
 | Check for network config conflicts | Fails if NetworkManager and ifupdown are both active simultaneously (RHEL) |
 | Check NTP is configured | Fails if no NTP or chrony service is active — clock drift causes auth failures post-migration |
-| Check for non-virtio network drivers | Fails if lspci shows e1000, vmxnet, or igb adapters that virt-v2v must convert |
 | Check for LVM thin provisioning | Fails if LVM thin-provisioned logical volumes are present — can cause conversion issues |
-| Check for stale mount entries in mtab | Fails if `/etc/mtab` contains `/dev/sd*` entries from the old hypervisor |
 | Check cloud-init datasource configuration | Fails if cloud-init is configured with a hypervisor-specific datasource (NoCloud, ConfigDrive, Ec2) |
-| Check for hypervisor-specific kernel modules | Fails if vmxnet, vmware, lpfc, qla2xxx, bnx2, or ixgbe modules are loaded |
 | Check for persistent net rules | Fails if `70-persistent-net.rules` exists — hardcodes MAC-to-interface bindings |
 | Check for hardware-dependent systemd units | Fails if systemd units have `After=/dev/` or `Requires=/dev/` dependencies |
-| Check for VMware Tools kernel module conflicts | Fails if vmxnet, pvscsi, or vmhgfs modules are loaded alongside `open-vm-tools` |
-| Check root filesystem resize capability | Fails if root filesystem is ext2 or ext3 — may not support online resize |
-| Check GRUB video configuration | Fails if GRUB has `GRUB_GFXMODE` or `GRUB_GFXPAYLOAD` — incompatible with KVM display |
-| Check resolv.conf is managed | Fails if `/etc/resolv.conf` is not managed by NetworkManager or dhclient |
 | Check Netplan configuration is valid | Fails if `netplan info` returns non-zero exit code (Ubuntu only) |
+| Check root filesystem free space | Fails if root filesystem has less than 1 GB free — virt-v2v needs space for conversion |
+| Check for hardcoded MAC addresses in ifcfg files | Fails if `HWADDR=` entries are found in RHEL network config — breaks after MAC change |
+| Check for hardcoded MAC addresses in Debian network config | Fails if `hwaddress` or `mac-address` entries found in Debian network config |
+| Check dracut is configured to include virtio modules | Fails if no dracut config references virtio — future initramfs rebuilds may omit virtio drivers (RHEL only) |
 | Check for huge pages configuration | Fails if huge pages are reserved — NUMA topology may differ on the KVM host |
 | Check AppArmor profiles for /dev/sd* references | Fails if AppArmor profiles reference `/dev/sd*` — may deny access to `/dev/vd*` post-migration |
 | Check auditd rules for /dev/sd* references | Fails if auditd rules reference `/dev/sd*` — will fail silently after device rename |
 | Check for real-time kernel | Fails if an RT kernel is in use — virtio driver compatibility may be affected |
 | Check for VMware-integrated backup agent packages | Fails if hypervisor-coupled backup agents are installed — lose vSphere snapshot integration |
 | Check for SR-IOV or PCI passthrough devices | Fails if SR-IOV or VFIO passthrough is in use — not portable without KubeVirt device plugin |
-| Check for hardcoded MAC addresses in ifcfg files | Fails if RHEL ifcfg files contain `HWADDR=` entries |
-| Check for hardcoded MAC addresses in Debian network config | Fails if Debian network config contains `hwaddress` or `mac-address` entries |
 
 ### LOW — Operational Concerns
 
 | Check | Description |
 |-------|-------------|
+| Check virtio drivers are in initramfs (RHEL) | Fails if `virtio_blk`, `virtio_scsi`, or `virtio_net` are missing from the RHEL initramfs — virt-v2v will inject them during conversion |
+| Check virtio drivers are in initramfs (Debian) | Fails if virtio drivers are missing from the Debian/Ubuntu initrd — virt-v2v will inject them during conversion |
+| Check Secure Boot state | Fails if Secure Boot is enabled — verify virtio drivers are signed for the target (distro-shipped modules are already signed) |
+| Check partition table type | Fails if primary disk uses MBR partition table instead of GPT |
 | Check for problematic cron entries | Fails if cron jobs reference `/dev/sd*`, NFS mounts, or external hostnames |
 | Check for Docker host device mounts | Fails if running Docker containers have `/dev/` bind mounts |
 | Check for legacy network interface naming | Fails if interfaces use legacy `eth0`-style names instead of predictable names |
-| Check for software RAID arrays | Fails if active mdadm RAID arrays are present — may need resync after device rename |
-| Check disk SMART health status | Fails if disk SMART overall health is not `PASSED` |
 | Check swap uses UUID in fstab | Fails if swap entry in `/etc/fstab` uses a `/dev/sd*` path instead of UUID |
 | Check Docker storage driver | Fails if Docker uses `devicemapper` storage driver on top of LVM |
-| Check /tmp mount options | Fails if `/tmp` is mounted with `noexec` or `nosuid` — may block virt-v2v driver installation |
 | Check for syslog forwarding | Fails if rsyslog is configured to forward logs to an external host |
 | Check timezone is set to UTC | Fails if system timezone is not UTC or Etc/UTC |
+| Check root filesystem resize capability | Fails if root filesystem is ext2 or ext3 — may not support online resize |
+| Check GRUB video configuration | Fails if GRUB has `GRUB_GFXMODE` or `GRUB_GFXPAYLOAD` — incompatible with KVM display |
+| Check resolv.conf is managed | Fails if `/etc/resolv.conf` is not managed by NetworkManager or dhclient |
 | Check for running Podman containers | Fails if Podman containers are running — stop before migration for filesystem consistency |
 | Check for running Docker containers | Fails if Docker containers are running — stop before migration for filesystem consistency |
 | Check for virt-who VMware configuration | Fails if virt-who is configured for VMware — RHEL subscription needs re-registration post-migration |
@@ -303,13 +290,16 @@ Run **before** virt-v2v conversion while the VM is still on VMware vSphere.
 | Task | Description |
 |------|-------------|
 | INFO Boot mode | Logs whether system uses UEFI or BIOS/Legacy boot |
-| INFO Total provisioned disk size | Logs total GB across all disk devices — used to plan conversion storage |
+| INFO SELinux mode | Logs current SELinux status and mode |
+| INFO SELinux autorelabel notification | Notes that virt-v2v handles SELinux relabeling automatically during conversion when SELinux is enforcing |
+| INFO Non-virtio network drivers | Logs e1000, vmxnet, or igb adapters detected via lspci |
+| INFO Hypervisor-specific kernel modules | Logs vmxnet, vmware, lpfc, qla2xxx, or bnx2 modules currently loaded |
+| INFO VMware Tools kernel module conflicts | Logs vmxnet, pvscsi, or vmhgfs modules loaded alongside `open-vm-tools` |
 | INFO Network interface count | Logs number of non-loopback interfaces |
+| INFO NIC details | Logs each interface's MAC, IP, driver, and MTU |
 | Warn if multiple NICs detected | Warns if more than 1 NIC is present — each must be mapped in KubeVirt VM spec |
 | INFO Static IP files found | Logs paths to static IP configuration files found |
 | INFO Huge pages total | Logs total huge pages reserved |
-| INFO journald storage mode | Warns if journald uses persistent storage — consider volatile before migration |
-| INFO Total disk utilization | Logs total used disk space across all filesystems |
 | INFO MTU values | Logs interfaces with non-standard MTU values |
 
 ---
@@ -419,7 +409,6 @@ Requires WinRM access and the `ansible.windows` collection.
 | Check no Dynamic disks are present | Fails if any disk has `Dynamic` partition style — virt-v2v supports Basic layout only |
 | Check no ReFS volumes are present | Fails if any volume uses the ReFS filesystem — no virt-v2v conversion support |
 | Check Windows version is compatible | Fails if Windows version is below 6.1 (Windows 7 / Server 2008 R2) |
-| Check Secure Boot state | Fails if Secure Boot is enabled — virtio drivers must be signed to pass Secure Boot validation |
 | Check no pending reboot | Fails if reboot registry keys are set — converting a system with a pending reboot produces an inconsistent disk |
 | Check BCD store integrity | Fails if `bcdedit /enum all` returns non-zero — a corrupt BCD causes immediate boot failure after conversion |
 
@@ -431,9 +420,12 @@ Requires WinRM access and the `ansible.windows` collection.
 | Check VMware Tools service is running | Fails if `VMTools` service is not in running state |
 | Check for NSX or vShield agent services | Fails if `vsepflt`, `vnetflt`, NSX, or vShield services are found — hypervisor-coupled, will break networking on KVM |
 | Check for VMware Horizon or View agent | Fails if Horizon or ViewAgent package is installed — non-functional on KVM |
+| Check for EDR or AV agent services | Fails if EDR/AV services are running — may block virt-v2v conversion and QEMU-GA install post-migration |
 | Check for running database services | Fails if MSSQL, Exchange, MySQL, Oracle, or MongoDB is running without a quiesce plan — risk of data corruption |
 | Check C drive has sufficient free space | Fails if C: has less than 2 GB free — virt-v2v needs workspace on the system volume |
+| Check VSS service is not disabled | Fails if VSS service StartType is Disabled — virt-v2v cannot take a shadow copy snapshot |
 | Check VSS writers are healthy | Fails if any VSS writer is in a failed or error state — snapshot consistency cannot be guaranteed |
+| Check VSS provider is registered | Fails if Microsoft Software Shadow Copy provider is not registered — shadow copy creation will fail |
 
 ### MEDIUM — Operational Concerns
 
@@ -450,6 +442,7 @@ Requires WinRM access and the `ansible.windows` collection.
 
 | Check | Description |
 |-------|-------------|
+| Check Secure Boot state | Fails if Secure Boot is enabled — verify virtio drivers are signed for the target platform (MTV provides signed drivers) |
 | Check RDP is enabled | Fails if RDP is disabled — remote access will not be available after migration |
 | INFO VMware registry keys | Logs presence of `HKLM:\SOFTWARE\VMware, Inc.` for post-migration cleanup reference |
 | INFO Disk inventory | Logs each disk's size, partition style, and operational status |
