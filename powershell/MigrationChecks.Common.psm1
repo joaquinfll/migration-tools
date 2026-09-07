@@ -22,6 +22,8 @@ $Script:PreMigrationDatabaseServices = @(
     'MongoDB'
 )
 
+$Script:InfoMessages = [System.Collections.Generic.List[PSCustomObject]]::new()
+
 function New-MigrationCheckResult {
     [CmdletBinding()]
     param(
@@ -45,8 +47,8 @@ function New-MigrationCheckResult {
         Label    = "[$Severity] $Name"
         Name     = $Name
         Passed   = $Passed
-        Message  = $(if ($Message) { $Message } else { $Name })
-        Detail   = $Detail
+        Message  = $(if (-not $Passed) { if ($Message) { $Message } else { $Name } } else { $null })
+        Detail   = $(if (-not $Passed) { $Detail } else { $null })
     }
 }
 
@@ -57,6 +59,7 @@ function Write-MigrationInfo {
         [string]$Message
     )
 
+    $Script:InfoMessages.Add([PSCustomObject]@{ Level = 'INFO'; Text = $Message })
     Write-Host "INFO: $Message" -ForegroundColor Cyan
 }
 
@@ -67,6 +70,7 @@ function Write-MigrationWarning {
         [string]$Message
     )
 
+    $Script:InfoMessages.Add([PSCustomObject]@{ Level = 'WARNING'; Text = $Message })
     Write-Host "WARNING: $Message" -ForegroundColor Yellow
 }
 
@@ -212,6 +216,7 @@ function Export-MigrationCheckReport {
         Hostname  = $env:COMPUTERNAME
         Passed    = @($Results | Where-Object { $_.Passed }).Count
         Failed    = @($Results | Where-Object { -not $_.Passed }).Count
+        Messages  = @($Script:InfoMessages)
         Results   = $Results
     }
 
