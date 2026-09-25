@@ -474,6 +474,90 @@
       ansible.builtin.debug:
         msg: "Kernel: {{ ansible_facts['kernel'] }}"
 
+    # ============ HIGH: Static IP preserved after migration ============
+    # LESSON LEARNED: ~90% of IP loss cases occurred when VMs were powered off
+    # before migration — VMware Tools cannot report guest network details to MTV
+    # when the VM is off. Always leave VMs powered on (stop application services only)
+    # and let MTV manage the power state. Verify IPs are preserved post-migration.
+    # Set expected_ip or expected_ips (list) to validate.
+    # Ref: https://docs.redhat.com/en/documentation/migration_toolkit_for_virtualization/2.12/html/planning_your_migration_to_red_hat_openshift_virtualization/assembly_planning-migration-vmware_mtv
+
+    - name: Verify static IP address preserved after migration
+      ansible.builtin.debug:
+        msg: >-
+          Expected IP '{{ expected_ip }}' NOT found among current addresses:
+          {{ ansible_facts['all_ipv4_addresses'] | join(', ') }}.
+          This commonly happens when the source VM was powered off before migration.
+      failed_when: expected_ip not in ansible_facts['all_ipv4_addresses']
+      changed_when: false
+      ignore_errors: true
+      register: ip_preserved_check
+      when: expected_ip is defined
+
+    - name: Verify all expected IPs preserved after migration
+      ansible.builtin.debug:
+        msg: >-
+          Missing IPs: {{ expected_ips | difference(ansible_facts['all_ipv4_addresses']) | join(', ') }}.
+          Current IPs: {{ ansible_facts['all_ipv4_addresses'] | join(', ') }}.
+      failed_when: (expected_ips | difference(ansible_facts['all_ipv4_addresses'])) | length > 0
+      changed_when: false
+      ignore_errors: true
+      register: ips_preserved_check
+      when: expected_ips is defined
+
+    # ============ HIGH: Firmware UUID preserved for licence-bound applications ============
+    # LESSON LEARNED: Some application licences are tied to the VM's firmware/SMBIOS UUID.
+    # After migration the effective firmware UUID may not be preserved in the required
+    # format. The workaround is to prevent automatic boot, compare the VMware BIOS UUID
+    # with the migrated VM's UUID, and update spec.template.spec.domain.firmware.uuid
+    # in the KubeVirt VM YAML before starting the VM.
+    # Set expected_firmware_uuid (from the source VMware BIOS UUID) to validate.
+    # Ref: https://access.redhat.com/solutions/7144087
+
+    - name: Get current SMBIOS UUID
+      ansible.builtin.shell: |
+        cat /sys/class/dmi/id/product_uuid 2>/dev/null || dmidecode -s system-uuid 2>/dev/null || true
+      changed_when: false
+      ignore_errors: true
+      register: current_uuid
+
+    - name: INFO Current firmware UUID
+      ansible.builtin.debug:
+        msg: "Current SMBIOS UUID: {{ current_uuid.stdout | trim | upper }}"
+      when: current_uuid.stdout | trim | length > 0
+
+    - name: Verify firmware UUID matches source VMware UUID
+      ansible.builtin.debug:
+        msg: >-
+          Firmware UUID MISMATCH — Current: {{ current_uuid.stdout | trim | upper }},
+          Expected: {{ expected_firmware_uuid | upper }}.
+          Application licences tied to this UUID may be invalid.
+          Fix: update spec.template.spec.domain.firmware.uuid in the KubeVirt VM YAML,
+          then restart the VM.
+      failed_when: current_uuid.stdout | trim | upper != expected_firmware_uuid | upper
+      changed_when: false
+      ignore_errors: true
+      register: uuid_check
+      when: expected_firmware_uuid is defined and current_uuid.stdout | trim | length > 0
+
+    # ============ MEDIUM: Default gateway reachable via ICMP ============
+    # LESSON LEARNED: Incorrect CUDN VLAN configuration can prevent gateway
+    # connectivity even when IP settings appear correct inside the guest OS.
+    # Verify actual ICMP reachability to the default gateway, not just route presence.
+
+    - name: Verify default gateway is reachable (ICMP ping)
+      ansible.builtin.shell: |
+        gw=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
+        if [ -n "$gw" ]; then
+          ping -c 2 -W 3 "$gw" >/dev/null 2>&1 && echo "ok" || echo "unreachable: $gw"
+        else
+          echo "no gateway"
+        fi
+      changed_when: false
+      ignore_errors: true
+      register: gw_ping_check
+      failed_when: gw_ping_check.stdout != 'ok'
+
     # ============ AGGREGATION: Report all failures at the end ============
 
     - name: Build failed check list
@@ -511,7 +595,11 @@
               {'label': '[MEDIUM] Default route', 'msg': 'No default route found — network may be misconfigured'} if default_route_check is defined and 'failed' in default_route_check and default_route_check.failed else None,
               {'label': '[LOW] virtio-serial channel', 'msg': '/dev/virtio-ports/ not found — qemu-guest-agent may not communicate'} if virtio_serial_check is defined and 'failed' in virtio_serial_check and virtio_serial_check.failed else None,
               {'label': '[LOW] VMDK remnants', 'msg': 'VMDK files found on disk: ' + vmdk_remnant_check.stdout} if vmdk_remnant_check is defined and 'failed' in vmdk_remnant_check and vmdk_remnant_check.failed else None,
-              {'label': '[LOW] dmesg errors', 'msg': 'KVM/virtio errors found in dmesg'} if dmesg_check is defined and 'failed' in dmesg_check and dmesg_check.failed else None
+              {'label': '[LOW] dmesg errors', 'msg': 'KVM/virtio errors found in dmesg'} if dmesg_check is defined and 'failed' in dmesg_check and dmesg_check.failed else None,
+              {'label': '[HIGH] Static IP lost', 'msg': 'Expected IP not found after migration — source VM may have been powered off before migration. Expected: ' + (expected_ip | default('n/a')) + ', Current: ' + (ansible_facts['all_ipv4_addresses'] | join(', '))} if ip_preserved_check is defined and 'failed' in ip_preserved_check and ip_preserved_check.failed else None,
+              {'label': '[HIGH] Static IPs lost', 'msg': 'One or more expected IPs missing after migration. Missing: ' + ((expected_ips | default([])) | difference(ansible_facts['all_ipv4_addresses']) | join(', '))} if ips_preserved_check is defined and 'failed' in ips_preserved_check and ips_preserved_check.failed else None,
+              {'label': '[HIGH] Firmware UUID mismatch', 'msg': 'SMBIOS UUID does not match source VMware UUID — licence-bound applications may break. Current: ' + (current_uuid.stdout | default('') | trim | upper) + ', Expected: ' + (expected_firmware_uuid | default('') | upper)} if uuid_check is defined and 'failed' in uuid_check and uuid_check.failed else None,
+              {'label': '[MEDIUM] Gateway unreachable', 'msg': 'Default gateway is not reachable via ICMP ping — check CUDN VLAN configuration: ' + (gw_ping_check.stdout | default(''))} if gw_ping_check is defined and 'failed' in gw_ping_check and gw_ping_check.failed else None
             ] | reject('equalto', None) | list
           }}
 

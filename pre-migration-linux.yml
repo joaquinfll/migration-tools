@@ -1043,6 +1043,155 @@
         'cloud-init' in ansible_facts['packages'] and
         cloudinit_vmware_guestinfo_check.stdout | length == 0
 
+    # ============ HIGH: Target namespace ResourceQuota may block MTV pods ============
+    # LESSON LEARNED: MTV helper pods (wait-for-reboot, etc.) and virt-launcher pods
+    # require explicit CPU/memory requests. If the target namespace enforces a
+    # ResourceQuota, pods without resource specs are rejected and the migration fails.
+    # With delete-on-failure policy, the target VM is removed — requiring full remigration.
+    # Ref: https://access.redhat.com/solutions/2841971
+
+    - name: Check target namespace ResourceQuota may block MTV pods
+      ansible.builtin.shell: |
+        quotas=$(oc get resourcequota -n {{ target_namespace }} --no-headers 2>/dev/null || true)
+        if [ -n "$quotas" ]; then
+          echo "$quotas" | awk '{print $1}'
+        fi
+      delegate_to: localhost
+      changed_when: false
+      ignore_errors: true
+      register: ns_quota_check
+      failed_when: ns_quota_check.stdout | trim | length > 0
+      when: target_namespace is defined
+
+    # ============ HIGH: Target namespace memory quota insufficient for virt-launcher ============
+    # LESSON LEARNED: Even when a namespace quota exists, it may not have enough free
+    # memory to accommodate the virt-launcher pod overhead (typically 1–8 Gi beyond
+    # the VM's own memory). MTV flags this as a failed migration and — with
+    # delete-on-failure policy — removes the target VM automatically.
+    # Ref: https://access.redhat.com/solutions/7135435
+
+    - name: INFO Target namespace memory quota details
+      ansible.builtin.shell: |
+        oc get resourcequota -n {{ target_namespace }} -o jsonpath='{range .items[*]}{.metadata.name}{": used="}{.status.used.limits\.memory}{" hard="}{.status.hard.limits\.memory}{"\n"}{end}' 2>/dev/null || true
+      delegate_to: localhost
+      changed_when: false
+      ignore_errors: true
+      register: ns_memory_quota_info
+      when: >
+        target_namespace is defined and
+        ns_quota_check is defined and ns_quota_check.stdout | trim | length > 0
+
+    - name: Warn about namespace ResourceQuota — verify sufficient headroom for MTV pods
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: Target namespace '{{ target_namespace }}' has ResourceQuota(s): {{ ns_quota_check.stdout_lines | join(', ') }}.
+          Quota details: {{ ns_memory_quota_info.stdout | default('unavailable') | trim }}.
+          Ensure sufficient CPU/memory headroom exists for MTV helper pods and virt-launcher
+          (typically needs 1–8 Gi overhead). Consider temporarily relaxing the quota during migration.
+      when: >
+        target_namespace is defined and
+        ns_quota_check is defined and ns_quota_check.stdout | trim | length > 0
+      changed_when: false
+
+    # ============ HIGH: Large XFS volumes risk virt-v2v appliance OOM ============
+    # LESSON LEARNED: virt-v2v's in-appliance guest filesystem processing can exhaust
+    # memory when converting very large XFS data volumes. The guest filesystem service
+    # is OOM-killed and the conversion pod exits — disk transfer completes but the
+    # target VM is never created. Flag volumes ≥ 500 GB for operator awareness.
+    # Ref: https://access.redhat.com/solutions/7135435
+
+    - name: Check for large XFS volumes that may cause virt-v2v OOM
+      ansible.builtin.shell: |
+        df -BG -t xfs 2>/dev/null | awk 'NR>1{gsub("G",""); if ($2+0 >= 500) print $1 " (" $2 "G)"}' || true
+      changed_when: false
+      ignore_errors: true
+      register: large_xfs_check
+      failed_when: large_xfs_check.stdout | length > 0
+
+    # ============ HIGH: Multiple NICs on the same subnet/VLAN ============
+    # LESSON LEARNED: CUDNs automatically generate one NAD per VLAN per namespace.
+    # If a VM has 2+ NICs on the same VLAN, both try to reference the same NAD —
+    # but OCP only allows attaching a given NAD once to a single VM. A second NAD
+    # with identical VLAN config but a different metadata name must be created manually.
+    # Ref: https://access.redhat.com/solutions/7127147
+
+    - name: Check for multiple NICs on the same subnet (same VLAN risk)
+      ansible.builtin.shell: |
+        python3 -c "
+        import subprocess, ipaddress, collections
+        out = subprocess.check_output(['ip', '-4', '-o', 'addr', 'show', 'scope', 'global'], text=True)
+        nets = collections.defaultdict(list)
+        for line in out.strip().split('\n'):
+            if not line.strip():
+                continue
+            parts = line.split()
+            iface = parts[1]
+            cidr = parts[3]
+            net = str(ipaddress.ip_interface(cidr).network)
+            nets[net].append(iface)
+        dups = {k: v for k, v in nets.items() if len(set(v)) > 1}
+        for net, ifaces in dups.items():
+            print(f'{net}: {\" \".join(ifaces)}')
+        " 2>/dev/null || true
+      changed_when: false
+      ignore_errors: true
+      register: dup_vlan_check
+      failed_when: dup_vlan_check.stdout | length > 0
+
+    # ============ HIGH: Pre-existing VMware snapshots block warm migration ============
+    # LESSON LEARNED: MTV can leave residual "forklift" snapshots on the source VM
+    # after a failed migration. Subsequent warm migration attempts fail because of
+    # incompatible pre-existing snapshots — even though no user-created snapshots are
+    # visible in vCenter. Consolidate and remove ALL snapshots (including hidden/orphaned
+    # ones) in vCenter before retrying.
+    # Requires govc CLI and vCenter credentials. Set vcenter_hostname, vcenter_username,
+    # vcenter_password, vcenter_datacenter, and optionally vcenter_vm_path.
+
+    - name: Check for pre-existing VMware snapshots (requires govc)
+      ansible.builtin.shell: |
+        output=$(govc snapshot.tree -vm '{{ vcenter_vm_path | default(inventory_hostname) }}' 2>/dev/null || true)
+        if [ -n "$output" ]; then
+          echo "$output"
+        fi
+      environment:
+        GOVC_URL: "{{ vcenter_hostname }}"
+        GOVC_USERNAME: "{{ vcenter_username }}"
+        GOVC_PASSWORD: "{{ vcenter_password }}"
+        GOVC_INSECURE: "{{ vcenter_insecure | default('1') }}"
+        GOVC_DATACENTER: "{{ vcenter_datacenter | default('') }}"
+      delegate_to: localhost
+      changed_when: false
+      ignore_errors: true
+      register: snapshot_check
+      failed_when: snapshot_check.stdout | trim | length > 0
+      when: vcenter_hostname is defined and vcenter_username is defined
+
+    # ============ CRITICAL: Guest OS not certified for OpenShift Virtualization ============
+    # LESSON LEARNED: A VM running Oracle Linux 7.9 kernel-panicked immediately after
+    # migration to OCP-V because the OS version is not in the certified guest OS matrix.
+    # Always verify the guest OS version against the Red Hat certified list before migrating.
+    # Ref: https://access.redhat.com/articles/4234591
+
+    - name: Check guest OS is certified for OpenShift Virtualization
+      ansible.builtin.debug:
+        msg: >-
+          {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}
+          may not be certified for OpenShift Virtualization.
+          Verify compatibility at https://access.redhat.com/articles/4234591
+      failed_when: true
+      changed_when: false
+      ignore_errors: true
+      register: unsupported_os_check
+      when: >
+        (ansible_facts['distribution'] == 'OracleLinux' and
+         ansible_facts['distribution_major_version'] | int < 8)
+        or
+        (ansible_facts['distribution'] == 'Scientific' and
+         ansible_facts['distribution_major_version'] | int < 7)
+        or
+        (ansible_facts['distribution'] == 'Amazon' and
+         ansible_facts['distribution_major_version'] | int < 2)
+
     # ============ AGGREGATION: Report all failures at the end ============
 
     - name: Build failed check list
@@ -1116,7 +1265,12 @@
               {'label': '[LOW] Docker containers running', 'msg': 'Docker containers are running — stop before migration for filesystem consistency'} if docker_running_check is defined and 'failed' in docker_running_check and docker_running_check.failed else None,
               {'label': '[LOW] virt-who VMware config', 'msg': 'virt-who VMware config detected — RHEL subscription needs re-registration after migration'} if virtwho_check is defined and 'failed' in virtwho_check and virtwho_check.failed else None,
               {'label': '[LOW] Non-standard MTU', 'msg': 'Non-standard MTU detected — may cause fragmentation on OVN overlay network (default MTU 1400)'} if mtu_check is defined and 'failed' in mtu_check and mtu_check.failed else None,
-              {'label': '[LOW] cloud-init VMwareGuestInfo', 'msg': 'cloud-init VMwareGuestInfo datasource not configured — network may not initialize on first boot in OpenShift Virtualization'} if cloudinit_vmware_guestinfo_check is defined and 'failed' in cloudinit_vmware_guestinfo_check and cloudinit_vmware_guestinfo_check.failed else None
+              {'label': '[LOW] cloud-init VMwareGuestInfo', 'msg': 'cloud-init VMwareGuestInfo datasource not configured — network may not initialize on first boot in OpenShift Virtualization'} if cloudinit_vmware_guestinfo_check is defined and 'failed' in cloudinit_vmware_guestinfo_check and cloudinit_vmware_guestinfo_check.failed else None,
+              {'label': '[HIGH] Namespace ResourceQuota', 'msg': 'Target namespace has ResourceQuota — MTV helper pods and virt-launcher may be rejected. Quota(s): ' + (ns_quota_check.stdout_lines | join(', '))} if ns_quota_check is defined and 'failed' in ns_quota_check and ns_quota_check.failed else None,
+              {'label': '[HIGH] Large XFS volumes', 'msg': 'XFS volume(s) ≥500 GB detected — virt-v2v appliance may run out of memory during conversion: ' + (large_xfs_check.stdout | trim)} if large_xfs_check is defined and 'failed' in large_xfs_check and large_xfs_check.failed else None,
+              {'label': '[HIGH] Multiple NICs same VLAN', 'msg': 'Multiple NICs share the same subnet/VLAN — CUDNs generate one NAD per VLAN, manual second NAD required: ' + (dup_vlan_check.stdout | trim)} if dup_vlan_check is defined and 'failed' in dup_vlan_check and dup_vlan_check.failed else None,
+              {'label': '[HIGH] VMware snapshots', 'msg': 'Pre-existing VMware snapshots detected — consolidate/remove before warm migration: ' + (snapshot_check.stdout | trim)} if snapshot_check is defined and 'failed' in snapshot_check and snapshot_check.failed else None,
+              {'label': '[CRITICAL] Unsupported guest OS', 'msg': ansible_facts['distribution'] + ' ' + ansible_facts['distribution_version'] + ' is not certified for OpenShift Virtualization — VM may kernel panic after migration. See https://access.redhat.com/articles/4234591'} if unsupported_os_check is defined and 'failed' in unsupported_os_check and unsupported_os_check.failed else None
             ] | reject('equalto', None) | list
           }}
 
