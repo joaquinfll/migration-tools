@@ -86,12 +86,12 @@ The post-migration **EDR blocking QEMU-GA** check runs only when the QEMU-GA ser
 
 ### Ansible-only checks (not in these scripts)
 
-These playbook tasks use `delegate_to: localhost` and tools that are not available on the Windows guest, so they remain Ansible-only:
+These checks are outside the Windows guest scripts:
 
-| Check | Why guest scripts cannot run it |
+| Check | Where it runs |
 |---|---|
-| Target namespace ResourceQuota | Requires `oc` and `target_namespace` on the control node |
-| Pre-existing vCenter snapshots | Requires `govc` and `vcenter_*` credentials on the control node |
+| Target namespace ResourceQuota | `pre-migration-windows.yml` on the control node (`oc`, `target_namespace`) |
+| Pre-existing or residual vCenter snapshots | `pre-migration-vmware.yml` or `post-migration-vmware.yml` (`community.vmware` against vCenter) |
 
 Run the Ansible playbooks from a host with those tools when you need ResourceQuota or vCenter snapshot validation.
 

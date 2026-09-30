@@ -588,34 +588,6 @@
       register: dup_vlan_win_check
       failed_when: dup_vlan_win_check.stdout | trim | length > 0
 
-    # ============ HIGH: Pre-existing VMware snapshots block warm migration ============
-    # LESSON LEARNED: MTV can leave residual "forklift" snapshots on the source VM
-    # after a failed migration. Subsequent warm migration attempts fail because of
-    # incompatible pre-existing snapshots — even though no user-created snapshots are
-    # visible in vCenter. Consolidate and remove ALL snapshots (including hidden/orphaned
-    # ones) in vCenter before retrying.
-    # Requires govc CLI and vCenter credentials. Set vcenter_hostname, vcenter_username,
-    # vcenter_password, vcenter_datacenter, and optionally vcenter_vm_path.
-
-    - name: Check for pre-existing VMware snapshots (requires govc)
-      ansible.builtin.shell: |
-        output=$(govc snapshot.tree -vm '{{ vcenter_vm_path | default(inventory_hostname) }}' 2>/dev/null || true)
-        if [ -n "$output" ]; then
-          echo "$output"
-        fi
-      environment:
-        GOVC_URL: "{{ vcenter_hostname }}"
-        GOVC_USERNAME: "{{ vcenter_username }}"
-        GOVC_PASSWORD: "{{ vcenter_password }}"
-        GOVC_INSECURE: "{{ vcenter_insecure | default('1') }}"
-        GOVC_DATACENTER: "{{ vcenter_datacenter | default('') }}"
-      delegate_to: localhost
-      changed_when: false
-      ignore_errors: true
-      register: snapshot_check
-      failed_when: snapshot_check.stdout | trim | length > 0
-      when: vcenter_hostname is defined and vcenter_username is defined
-
     # ============ AGGREGATION: Report all failures at the end ============
 
     - name: Build failed check list
@@ -644,8 +616,7 @@
               {'label': '[MEDIUM] Partition table (MBR)', 'msg': 'MBR partition table detected — ' + (partition_win_check.stdout | trim)} if partition_win_check is defined and 'failed' in partition_win_check and partition_win_check.failed else None,
               {'label': '[LOW] RDP disabled', 'msg': 'RDP is disabled — remote access will not be available after migration'} if rdp_check is defined and 'failed' in rdp_check and rdp_check.failed else None,
               {'label': '[HIGH] Namespace ResourceQuota', 'msg': 'Target namespace has ResourceQuota — MTV helper pods and virt-launcher may be rejected. Quota(s): ' + (ns_quota_check.stdout_lines | join(', '))} if ns_quota_check is defined and 'failed' in ns_quota_check and ns_quota_check.failed else None,
-              {'label': '[HIGH] Multiple NICs same VLAN', 'msg': 'Multiple NICs share the same subnet/VLAN — CUDNs generate one NAD per VLAN, manual second NAD required: ' + (dup_vlan_win_check.stdout | trim)} if dup_vlan_win_check is defined and 'failed' in dup_vlan_win_check and dup_vlan_win_check.failed else None,
-              {'label': '[HIGH] VMware snapshots', 'msg': 'Pre-existing VMware snapshots detected — consolidate/remove before warm migration: ' + (snapshot_check.stdout | trim)} if snapshot_check is defined and 'failed' in snapshot_check and snapshot_check.failed else None
+              {'label': '[HIGH] Multiple NICs same VLAN', 'msg': 'Multiple NICs share the same subnet/VLAN — CUDNs generate one NAD per VLAN, manual second NAD required: ' + (dup_vlan_win_check.stdout | trim)} if dup_vlan_win_check is defined and 'failed' in dup_vlan_win_check and dup_vlan_win_check.failed else None
             ] | reject('equalto', None) | list
           }}
 

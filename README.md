@@ -14,7 +14,7 @@ Each playbook validates the target hypervisor immediately after fact gathering �
 | SSH access | Linux target VM must be reachable over SSH |
 | WinRM access | Windows target VM must have WinRM enabled (HTTP port 5985 or HTTPS port 5986) |
 | `ansible.windows` collection | ≥ 2.0.0 — required for Windows playbooks only |
-| `community.vmware` collection | ≥ 6.2.0 — required for vSphere-only playbooks (`cbt-enable.yml`) |
+| `community.vmware` collection | ≥ 6.2.0 — required for vSphere playbooks (`cbt-enable.yml`, `pre-migration-vmware.yml`, `post-migration-vmware.yml`) |
 
 Install Galaxy collections after cloning:
 
@@ -141,6 +141,27 @@ ansible-playbook -i inventory post-migration-windows.yml
 ansible-playbook -i inventory post-migration-windows.yml --limit winvm.example.com
 ```
 
+### vCenter — snapshot checks (`pre-migration-vmware.yml`, `post-migration-vmware.yml`)
+
+Queries vCenter for snapshots on the source VMs. No SSH or WinRM access to the guest is required.
+Run the pre-migration playbook before a warm migration, and the post-migration playbook after an attempt, to catch residual MTV forklift snapshots.
+
+```bash
+ansible-playbook pre-migration-vmware.yml \
+  -e vcenter_hostname=vcenter.example.com \
+  -e vcenter_username=admin@vsphere.local \
+  -e vcenter_password='password' \
+  -e dc_name='Production-DC' \
+  -e vm_list='["web-01","db-01"]'
+
+ansible-playbook post-migration-vmware.yml \
+  -e vcenter_hostname=vcenter.example.com \
+  -e vcenter_username=admin@vsphere.local \
+  -e vcenter_password='password' \
+  -e dc_name='Production-DC' \
+  -e vm_list='["web-01","db-01"]'
+```
+
 ### vSphere — Enable CBT (`cbt-enable.yml`)
 
 Enables Changed Block Tracking (CBT) on all compatible disks across one or more VMs.
@@ -175,6 +196,7 @@ ansible-playbook cbt-enable.yml \
 python3 -m pip install --user ansible-lint
 ansible-lint pre-migration-linux.yml post-migration-linux.yml \
              pre-migration-windows.yml post-migration-windows.yml \
+             pre-migration-vmware.yml post-migration-vmware.yml \
              cbt-enable.yml
 ```
 
@@ -516,6 +538,28 @@ Requires WinRM access and the `ansible.windows` collection.
 | INFO IP addresses | Logs all IPv4 addresses assigned to the VM |
 | INFO DNS resolution result | Logs the IP returned for the hostname lookup |
 | INFO Windows version | Logs Windows edition, version number, and kernel build |
+
+---
+
+## `pre-migration-vmware.yml` and `post-migration-vmware.yml`
+
+Run against **vCenter** — no SSH or WinRM access to the guest is required.
+Both plays share [vmware-snapshot-check.yml](vmware-snapshot-check.yml) and use `community.vmware.vmware_guest_snapshot_info`.
+
+| Playbook | When to run | Failure |
+|---|---|---|
+| `pre-migration-vmware.yml` | Before warm migration | Any snapshot exists on a source VM, including hidden MTV forklift snapshots |
+| `post-migration-vmware.yml` | After a migration attempt, before retrying warm migration | Residual snapshots remain on a source VM |
+
+| Variable | Required | Description |
+|---|---|---|
+| `vcenter_hostname` | Yes | vCenter Server hostname or IP |
+| `vcenter_username` | Yes | vCenter username (e.g., `admin@vsphere.local`) |
+| `vcenter_password` | Yes | vCenter password |
+| `dc_name` | Yes | vCenter datacenter name |
+| `vm_list` | Yes | List of source VM names to inspect |
+
+A lookup error for a VM is reported with the other failures. The play fails once at the end if any VM has snapshots or could not be queried.
 
 ---
 
