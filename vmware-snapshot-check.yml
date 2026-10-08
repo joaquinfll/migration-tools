@@ -1,0 +1,33 @@
+# Query vCenter for snapshots on one VM.
+# Included by pre-migration-vmware.yml and post-migration-vmware.yml.
+# Expects vm_name, dc_name, vcenter_* credentials, snapshot_fail_message,
+# and snapshot_failures (list) in scope.
+---
+- name: Gather snapshot info for {{ vm_name }}
+  community.vmware.vmware_guest_snapshot_info:
+    hostname: "{{ vcenter_hostname }}"
+    username: "{{ vcenter_username }}"
+    password: "{{ vcenter_password }}"
+    validate_certs: false
+    datacenter: "{{ dc_name }}"
+    name: "{{ vm_name }}"
+  delegate_to: localhost
+  no_log: true
+  register: snapshot_info
+  ignore_errors: true
+
+- name: Record snapshot check result for {{ vm_name }}
+  ansible.builtin.set_fact:
+    snapshot_failures: "{{ snapshot_failures + [snapshot_failure_line] }}"
+  vars:
+    snapshots: "{{ (snapshot_info.guest_snapshots | default({})).snapshots | default([]) }}"
+    snapshot_names: "{{ snapshots | map(attribute='name') | join(', ') }}"
+    snapshot_failure_line: >-
+      {{
+        '[HIGH] ' + vm_name + ': snapshot query failed — ' + (snapshot_info.msg | default('vCenter API error'))
+        if (snapshot_info.failed | default(false) | bool)
+        else '[HIGH] ' + vm_name + ': ' + snapshot_fail_message + ' Snapshots: ' + snapshot_names
+      }}
+  when: >
+    snapshot_info.failed | default(false) or
+    ((snapshot_info.guest_snapshots | default({})).snapshots | default([])) | length > 0

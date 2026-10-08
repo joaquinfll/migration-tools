@@ -393,6 +393,120 @@
       ansible.builtin.debug:
         msg: "{{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}"
 
+    # ============ HIGH: Static IP preserved after migration ============
+    # LESSON LEARNED: ~90% of IP loss cases occurred when VMs were powered off
+    # before migration — VMware Tools cannot report guest network details to MTV
+    # when the VM is off. Always leave VMs powered on (stop application services only)
+    # and let MTV manage the power state. Verify IPs are preserved post-migration.
+    # Set expected_ip or expected_ips (list) to validate.
+    # Ref: https://docs.redhat.com/en/documentation/migration_toolkit_for_virtualization/2.12/html/planning_your_migration_to_red_hat_openshift_virtualization/assembly_planning-migration-vmware_mtv
+
+    - name: Verify static IP address preserved after migration
+      ansible.builtin.debug:
+        msg: >-
+          Expected IP '{{ expected_ip }}' NOT found among current addresses:
+          {{ win_ipv4_info.stdout_lines | join(', ') }}.
+          This commonly happens when the source VM was powered off before migration.
+      failed_when: expected_ip not in (win_ipv4_info.stdout_lines | map('trim') | list)
+      changed_when: false
+      ignore_errors: true
+      register: ip_preserved_win_check
+      when: expected_ip is defined and win_ipv4_info is defined
+
+    - name: Verify all expected IPs preserved after migration
+      ansible.builtin.debug:
+        msg: >-
+          Missing IPs: {{ expected_ips | difference(win_ipv4_info.stdout_lines | map('trim') | list) | join(', ') }}.
+          Current IPs: {{ win_ipv4_info.stdout_lines | map('trim') | join(', ') }}.
+      failed_when: (expected_ips | difference(win_ipv4_info.stdout_lines | map('trim') | list)) | length > 0
+      changed_when: false
+      ignore_errors: true
+      register: ips_preserved_win_check
+      when: expected_ips is defined and win_ipv4_info is defined
+
+    # ============ HIGH: Firmware UUID preserved for licence-bound applications ============
+    # LESSON LEARNED: Some application licences are tied to the VM's firmware/SMBIOS UUID.
+    # After migration the effective firmware UUID may not be preserved in the required
+    # format. The workaround is to prevent automatic boot, compare the VMware BIOS UUID
+    # with the migrated VM's UUID, and update spec.template.spec.domain.firmware.uuid
+    # in the KubeVirt VM YAML before starting the VM.
+    # Set expected_firmware_uuid (from the source VMware BIOS UUID) to validate.
+    # Ref: https://access.redhat.com/solutions/7144087
+
+    - name: Get current SMBIOS UUID
+      ansible.windows.win_shell: |
+        (Get-WmiObject Win32_ComputerSystemProduct).UUID
+      changed_when: false
+      ignore_errors: true
+      register: current_uuid_win
+
+    - name: INFO Current firmware UUID
+      ansible.builtin.debug:
+        msg: "Current SMBIOS UUID: {{ current_uuid_win.stdout | trim | upper }}"
+      when: current_uuid_win.stdout | trim | length > 0
+
+    - name: Verify firmware UUID matches source VMware UUID
+      ansible.builtin.debug:
+        msg: >-
+          Firmware UUID MISMATCH — Current: {{ current_uuid_win.stdout | trim | upper }},
+          Expected: {{ expected_firmware_uuid | upper }}.
+          Application licences tied to this UUID may be invalid.
+          Fix: update spec.template.spec.domain.firmware.uuid in the KubeVirt VM YAML,
+          then restart the VM.
+      failed_when: current_uuid_win.stdout | trim | upper != expected_firmware_uuid | upper
+      changed_when: false
+      ignore_errors: true
+      register: uuid_win_check
+      when: expected_firmware_uuid is defined and current_uuid_win.stdout | trim | length > 0
+
+    # ============ HIGH: All volumes writable (not read-only) ============
+    # LESSON LEARNED: During warm migration, if the VMware Snapshot Provider (VSS
+    # provider) is disabled or stopped on the source VM, the guest filesystem cannot
+    # be properly quiesced during snapshot. virt-v2v-inspector then encounters the
+    # disk as read-only and the migration fails. Post-migration, verify all fixed
+    # volumes are writable — a read-only volume indicates conversion problems.
+    # Ref: https://access.redhat.com/solutions/7142019
+
+    - name: Verify all fixed volumes are writable (not read-only)
+      ansible.windows.win_shell: |
+        $ro = @()
+        Get-Volume | Where-Object {
+          $_.DriveType -eq 'Fixed' -and $_.DriveLetter -and $_.FileSystem
+        } | ForEach-Object {
+          $testFile = "$($_.DriveLetter):\\.ansible_write_test_$(Get-Random)"
+          try {
+            [IO.File]::WriteAllText($testFile, "test")
+            Remove-Item $testFile -Force -ErrorAction SilentlyContinue
+          } catch {
+            $ro += "$($_.DriveLetter):"
+          }
+        }
+        if ($ro) { $ro -join ', ' } else { "" }
+      changed_when: false
+      ignore_errors: true
+      register: volume_writable_check
+      failed_when: volume_writable_check.stdout | trim | length > 0
+
+    # ============ MEDIUM: Default gateway reachable via ICMP ============
+    # LESSON LEARNED: Incorrect CUDN VLAN configuration can prevent gateway
+    # connectivity even when IP settings appear correct inside the guest OS.
+    # The fix is to update the CUDN/NAD YAML to explicitly assign the correct VLAN
+    # (e.g., vlan.mode: Access, vlan.access.id: <correct_id>), then restart the VM.
+    # Verify actual ICMP reachability to the default gateway, not just route presence.
+
+    - name: Verify default gateway is reachable (ICMP ping)
+      ansible.windows.win_shell: |
+        $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+          Select-Object -First 1).NextHop
+        if ($gw) {
+          $result = Test-Connection -ComputerName $gw -Count 2 -Quiet -ErrorAction SilentlyContinue
+          if ($result) { "ok" } else { "unreachable: $gw" }
+        } else { "no gateway" }
+      changed_when: false
+      ignore_errors: true
+      register: gw_ping_win_check
+      failed_when: gw_ping_win_check.stdout | trim != 'ok'
+
     # ============ AGGREGATION: Report all failures at the end ============
 
     - name: Build failed check list
@@ -420,7 +534,12 @@
               {'label': '[MEDIUM] Time sync (W32Time)', 'msg': 'Windows Time service is not running — clock drift will break Kerberos and TLS'} if time_sync_check is defined and 'failed' in time_sync_check and time_sync_check.failed else None,
               {'label': '[MEDIUM] BCD VMware artifacts', 'msg': 'VMware entries found in BCD store — boot configuration may be contaminated'} if bcd_post_check is defined and 'failed' in bcd_post_check and bcd_post_check.failed else None,
               {'label': '[LOW] virtio-serial channel', 'msg': 'VirtIO serial device not found — QEMU Guest Agent communication channel may not function'} if virtio_serial_win_check is defined and 'failed' in virtio_serial_win_check and virtio_serial_win_check.failed else None,
-              {'label': '[LOW] RDP disabled', 'msg': 'RDP is disabled — remote access is not available'} if rdp_post_check is defined and 'failed' in rdp_post_check and rdp_post_check.failed else None
+              {'label': '[LOW] RDP disabled', 'msg': 'RDP is disabled — remote access is not available'} if rdp_post_check is defined and 'failed' in rdp_post_check and rdp_post_check.failed else None,
+              {'label': '[HIGH] Static IP lost', 'msg': 'Expected IP not found after migration — source VM may have been powered off before migration. Expected: ' + (expected_ip | default('n/a'))} if ip_preserved_win_check is defined and 'failed' in ip_preserved_win_check and ip_preserved_win_check.failed else None,
+              {'label': '[HIGH] Static IPs lost', 'msg': 'One or more expected IPs missing after migration. Missing: ' + ((expected_ips | default([])) | difference(win_ipv4_info.stdout_lines | default([]) | map('trim') | list) | join(', '))} if ips_preserved_win_check is defined and 'failed' in ips_preserved_win_check and ips_preserved_win_check.failed else None,
+              {'label': '[HIGH] Firmware UUID mismatch', 'msg': 'SMBIOS UUID does not match source VMware UUID — licence-bound applications may break. Current: ' + (current_uuid_win.stdout | default('') | trim | upper) + ', Expected: ' + (expected_firmware_uuid | default('') | upper)} if uuid_win_check is defined and 'failed' in uuid_win_check and uuid_win_check.failed else None,
+              {'label': '[HIGH] Read-only volumes', 'msg': 'One or more volumes are read-only — may indicate failed filesystem quiescing during conversion (enable VMware Snapshot Provider before migration): ' + (volume_writable_check.stdout | default('') | trim)} if volume_writable_check is defined and 'failed' in volume_writable_check and volume_writable_check.failed else None,
+              {'label': '[MEDIUM] Gateway unreachable', 'msg': 'Default gateway is not reachable via ICMP ping — check CUDN VLAN configuration (vlan.mode/vlan.access.id in NAD YAML): ' + (gw_ping_win_check.stdout | default('') | trim)} if gw_ping_win_check is defined and 'failed' in gw_ping_win_check and gw_ping_win_check.failed else None
             ] | reject('equalto', None) | list
           }}
 

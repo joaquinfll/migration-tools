@@ -349,6 +349,49 @@ if ($nicLines.Count -gt 1) {
     Write-MigrationWarning "$($nicLines.Count) NICs detected -- ensure all are mapped to target networks in KubeVirt VM spec"
 }
 
+# ============ HIGH: Multiple NICs on the same subnet/VLAN ============
+# LESSON LEARNED: CUDNs automatically generate one NAD per VLAN per namespace.
+# If a VM has 2+ NICs on the same VLAN, both try to reference the same NAD —
+# but OCP only allows attaching a given NAD once to a single VM. A second NAD
+# with identical VLAN config but a different metadata name must be created manually.
+
+$adapters = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Where-Object { $_.InterfaceAlias -notmatch 'Loopback' -and $_.PrefixOrigin -ne 'WellKnown' })
+$subnets = @{}
+foreach ($a in $adapters) {
+    $prefix = [int]$a.PrefixLength
+    if ($prefix -lt 0) { $prefix = 0 }
+    if ($prefix -gt 32) { $prefix = 32 }
+    # Mask bytes directly. PowerShell -shl uses signed Int32, so shifting 192<<24
+    # overflows and aborts the script on common addresses such as 192.168.0.0/24.
+    $bytes = [System.Net.IPAddress]::Parse($a.IPAddress).GetAddressBytes()
+    $fullBytes = [int][math]::Floor($prefix / 8)
+    $remainBits = $prefix % 8
+    for ($i = 0; $i -lt 4; $i++) {
+        if ($i -lt $fullBytes) { continue }
+        if ($i -eq $fullBytes -and $remainBits -gt 0) {
+            $mask = [byte]((0xFF -shl (8 - $remainBits)) -band 0xFF)
+            $bytes[$i] = [byte]($bytes[$i] -band $mask)
+        } else {
+            $bytes[$i] = 0
+        }
+    }
+    $key = ('{0}.{1}.{2}.{3}/{4}' -f $bytes[0], $bytes[1], $bytes[2], $bytes[3], $prefix)
+    if ($subnets.ContainsKey($key)) {
+        $subnets[$key] += ", $($a.InterfaceAlias)"
+    } else {
+        $subnets[$key] = $a.InterfaceAlias
+    }
+}
+$dups = @($subnets.GetEnumerator() | Where-Object { $_.Value -match ',' })
+$dupDetail = $(if ($dups.Count -gt 0) {
+    ($dups | ForEach-Object { "$($_.Key): $($_.Value)" }) -join '; '
+} else { '' })
+
+$results += New-MigrationCheckResult -Severity HIGH -Name 'Multiple NICs same VLAN' -Passed (
+    $dups.Count -eq 0
+) -Message "Multiple NICs share the same subnet/VLAN — CUDNs generate one NAD per VLAN, manual second NAD required: $dupDetail"
+
 # ============ AGGREGATION ============
 
 if ($JsonOutput) {

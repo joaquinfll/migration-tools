@@ -50,6 +50,20 @@ With inventory hostname validation and JSON output:
 .\Invoke-PostMigrationCheck.ps1 -ExpectedHostname winvm -JsonOutput C:\Temp\post-migration-report.json
 ```
 
+Validate preserved IP(s) and firmware UUID (optional; skipped when omitted):
+
+```powershell
+.\Invoke-PostMigrationCheck.ps1 -ExpectedIp 10.0.1.50
+
+.\Invoke-PostMigrationCheck.ps1 -ExpectedIps 10.0.1.50,10.0.1.51
+
+.\Invoke-PostMigrationCheck.ps1 `
+  -ExpectedHostname winvm `
+  -ExpectedIp 10.0.1.50 `
+  -ExpectedFirmwareUuid '4235A1B2-C3D4-5678-9ABC-DEF012345678' `
+  -JsonOutput C:\Temp\post-migration-report.json
+```
+
 ## Exit codes
 
 | Code | Meaning |
@@ -57,16 +71,29 @@ With inventory hostname validation and JSON output:
 | `0` | All checks passed |
 | `1` | One or more checks failed (see console output) |
 
+Optional `-JsonOutput` writes the same consolidated report to a JSON file (exit code is unchanged).
+
 ## Check parity
 
-These scripts mirror the same checks, severities, and failure aggregation as:
+These scripts mirror the same **guest-local** checks, severities, and failure aggregation as:
 
 - `pre-migration-windows.yml`
 - `post-migration-windows.yml`
 
-Informational tasks (disk/NIC inventory, domain membership, activation type warnings, pending updates) are logged but do not fail the run unless the Ansible playbook also treats them as failures.
+Informational tasks (disk/NIC inventory, domain membership, activation type warnings, pending updates, current SMBIOS UUID) are logged but do not fail the run unless the Ansible playbook also treats them as failures.
 
 The post-migration **EDR blocking QEMU-GA** check runs only when the QEMU-GA service check fails, matching the Ansible `when:` condition.
+
+### Ansible-only checks (not in these scripts)
+
+These checks are outside the Windows guest scripts:
+
+| Check | Where it runs |
+|---|---|
+| Target namespace ResourceQuota | `pre-migration-windows.yml` on the control node (`oc`, `target_namespace`) |
+| Pre-existing or residual vCenter snapshots | `pre-migration-vmware.yml` or `post-migration-vmware.yml` (`community.vmware` against vCenter) |
+
+Run the Ansible playbooks from a host with those tools when you need ResourceQuota or vCenter snapshot validation.
 
 ## Lint
 

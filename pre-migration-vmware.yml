@@ -1,0 +1,51 @@
+---
+# vCenter pre-migration checks
+# Run against vCenter before virt-v2v / MTV warm migration.
+# Does not need SSH or WinRM access to the guest.
+- name: Pre-migration checks for source VMs in vCenter
+  hosts: localhost
+  gather_facts: false
+  vars:
+    vm_list: []
+    snapshot_fail_message: >-
+      Pre-existing VMware snapshots detected — consolidate and remove them
+      before warm migration. Hidden MTV forklift snapshots are included.
+
+  tasks:
+    - name: Assert required variables are provided
+      ansible.builtin.assert:
+        that:
+          - vm_list | length > 0
+          - dc_name is defined and dc_name | length > 0
+          - vcenter_hostname is defined
+          - vcenter_username is defined
+          - vcenter_password is defined
+        fail_msg: >-
+          Required variables missing. Ensure vm_list (non-empty), dc_name,
+          vcenter_hostname, vcenter_username, and vcenter_password are all set.
+
+    - name: Reset snapshot failure list
+      ansible.builtin.set_fact:
+        snapshot_failures: []
+
+    - name: Check snapshots for each source VM
+      ansible.builtin.include_tasks: vmware-snapshot-check.yml
+      loop: "{{ vm_list }}"
+      loop_control:
+        loop_var: vm_name
+        label: "{{ vm_name }}"
+
+    - name: Report snapshot failures
+      ansible.builtin.debug:
+        msg: "{{ item }}"
+      loop: "{{ snapshot_failures }}"
+      loop_control:
+        label: "{{ item }}"
+      when: snapshot_failures | length > 0
+
+    - name: Fail if any source VM has snapshots
+      ansible.builtin.fail:
+        msg: >-
+          vCenter pre-migration checks failed. One or more source VMs have
+          snapshots. Consolidate and remove them before warm migration.
+      when: snapshot_failures | length > 0

@@ -13,15 +13,39 @@
     Optional inventory hostname (short name, without domain) for the hostname match check.
     When omitted, the hostname check is skipped.
 
+.PARAMETER ExpectedIp
+    Optional single IPv4 address that must still be present after migration.
+    When omitted, the Static IP lost check is skipped.
+
+.PARAMETER ExpectedIps
+    Optional list of IPv4 addresses that must still be present after migration.
+    When omitted, the Static IPs lost check is skipped.
+
+.PARAMETER ExpectedFirmwareUuid
+    Optional SMBIOS/firmware UUID from the source VMware VM.
+    When omitted, the Firmware UUID mismatch check is skipped.
+
 .EXAMPLE
     .\Invoke-PostMigrationCheck.ps1
 
 .EXAMPLE
     .\Invoke-PostMigrationCheck.ps1 -ExpectedHostname winvm -JsonOutput C:\Temp\post-migration-report.json
+
+.EXAMPLE
+    .\Invoke-PostMigrationCheck.ps1 -ExpectedIp 10.0.1.50 -ExpectedFirmwareUuid '4235A1B2-C3D4-5678-9ABC-DEF012345678'
+
+.EXAMPLE
+    .\Invoke-PostMigrationCheck.ps1 -ExpectedIps 10.0.1.50,10.0.1.51
 #>
 [CmdletBinding()]
 param(
     [string]$ExpectedHostname,
+
+    [string]$ExpectedIp,
+
+    [string[]]$ExpectedIps,
+
+    [string]$ExpectedFirmwareUuid,
 
     [string]$JsonOutput
 )
@@ -284,6 +308,107 @@ $rdpEnabled = ($rdpValue -eq 0)
 
 $results += New-MigrationCheckResult -Severity LOW -Name 'RDP disabled' -Passed $rdpEnabled `
     -Message 'RDP is disabled -- remote access is not available'
+
+# ============ HIGH: Static IP preserved after migration ============
+# LESSON LEARNED: ~90% of IP loss cases occurred when VMs were powered off
+# before migration — VMware Tools cannot report guest network details to MTV
+# when the VM is off. Always leave VMs powered on (stop application services only)
+# and let MTV manage the power state.
+
+if ($ExpectedIp) {
+    $ipFound = $ipv4Lines -contains $ExpectedIp
+    $results += New-MigrationCheckResult -Severity HIGH -Name 'Static IP lost' -Passed $ipFound `
+        -Message "Expected IP not found after migration — source VM may have been powered off before migration. Expected: $ExpectedIp"
+}
+
+if ($PSBoundParameters.ContainsKey('ExpectedIps') -and $null -ne $ExpectedIps) {
+    $expectedIpList = @($ExpectedIps)
+    if ($expectedIpList.Count -gt 0) {
+        $missingIps = @($expectedIpList | Where-Object { $ipv4Lines -notcontains $_ })
+        $missingDetail = $missingIps -join ', '
+        $results += New-MigrationCheckResult -Severity HIGH -Name 'Static IPs lost' -Passed (
+            $missingIps.Count -eq 0
+        ) -Message "One or more expected IPs missing after migration. Missing: $missingDetail"
+    }
+}
+
+# ============ HIGH: Firmware UUID preserved for licence-bound applications ============
+# LESSON LEARNED: Some application licences are tied to the VM's firmware/SMBIOS UUID.
+# Fix: update spec.template.spec.domain.firmware.uuid in the KubeVirt VM YAML, then restart.
+
+$currentUuid = ''
+try {
+    $csp = Get-CimInstance -ClassName Win32_ComputerSystemProduct -ErrorAction Stop
+    if ($csp -and $csp.UUID) {
+        $currentUuid = [string]$csp.UUID
+    }
+} catch {
+    try {
+        $csp = Get-WmiObject -Class Win32_ComputerSystemProduct -ErrorAction Stop
+        if ($csp -and $csp.UUID) {
+            $currentUuid = [string]$csp.UUID
+        }
+    } catch {
+    }
+}
+
+if (-not [string]::IsNullOrWhiteSpace($currentUuid)) {
+    Write-MigrationInfo "Current SMBIOS UUID: $($currentUuid.Trim().ToUpperInvariant())"
+}
+
+if ($ExpectedFirmwareUuid -and -not [string]::IsNullOrWhiteSpace($currentUuid)) {
+    $uuidMatch = ($currentUuid.Trim().ToUpperInvariant() -eq $ExpectedFirmwareUuid.Trim().ToUpperInvariant())
+    $results += New-MigrationCheckResult -Severity HIGH -Name 'Firmware UUID mismatch' -Passed $uuidMatch `
+        -Message ("SMBIOS UUID does not match source VMware UUID — licence-bound applications may break. " +
+            "Current: $($currentUuid.Trim().ToUpperInvariant()), Expected: $($ExpectedFirmwareUuid.Trim().ToUpperInvariant()). " +
+            "Fix: update spec.template.spec.domain.firmware.uuid in the KubeVirt VM YAML, then restart the VM.")
+}
+
+# ============ HIGH: All volumes writable (not read-only) ============
+# LESSON LEARNED: If the VMware Snapshot Provider (VSS) is disabled during warm
+# migration, virt-v2v may leave volumes read-only after conversion.
+
+$ro = @()
+$fixedVolumes = @(Get-Volume -ErrorAction SilentlyContinue | Where-Object {
+    $_.DriveType -eq 'Fixed' -and $_.DriveLetter -and $_.FileSystem
+})
+foreach ($vol in $fixedVolumes) {
+    $testFile = "$($vol.DriveLetter):\.migration_write_test_$(Get-Random)"
+    try {
+        [IO.File]::WriteAllText($testFile, 'test')
+        Remove-Item -LiteralPath $testFile -Force -ErrorAction SilentlyContinue
+    } catch {
+        $ro += "$($vol.DriveLetter):"
+        Remove-Item -LiteralPath $testFile -Force -ErrorAction SilentlyContinue
+    }
+}
+$roDetail = $ro -join ', '
+
+$results += New-MigrationCheckResult -Severity HIGH -Name 'Read-only volumes' -Passed (
+    $ro.Count -eq 0
+) -Message "One or more volumes are read-only — may indicate failed filesystem quiescing during conversion (enable VMware Snapshot Provider before migration): $roDetail"
+
+# ============ MEDIUM: Default gateway reachable via ICMP ============
+# LESSON LEARNED: Incorrect CUDN VLAN configuration can prevent gateway
+# connectivity even when IP settings appear correct inside the guest OS.
+
+$gwPingDetail = ''
+$gwReachable = $false
+if ($defaultGateway) {
+    try {
+        $gwReachable = [bool](Test-Connection -ComputerName $defaultGateway -Count 2 -Quiet -ErrorAction SilentlyContinue)
+    } catch {
+        $gwReachable = $false
+    }
+    if (-not $gwReachable) {
+        $gwPingDetail = "unreachable: $defaultGateway"
+    }
+} else {
+    $gwPingDetail = 'no gateway'
+}
+
+$results += New-MigrationCheckResult -Severity MEDIUM -Name 'Gateway unreachable' -Passed $gwReachable `
+    -Message "Default gateway is not reachable via ICMP ping — check CUDN VLAN configuration (vlan.mode/vlan.access.id in NAD YAML): $gwPingDetail"
 
 # ============ AGGREGATION ============
 

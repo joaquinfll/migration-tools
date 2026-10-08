@@ -506,6 +506,88 @@
       when: win_nic_inventory.stdout_lines | length > 1
       changed_when: false
 
+    # ============ HIGH: Target namespace ResourceQuota may block MTV pods ============
+    # LESSON LEARNED: MTV helper pods (wait-for-reboot, etc.) and virt-launcher pods
+    # require explicit CPU/memory requests. If the target namespace enforces a
+    # ResourceQuota, pods without resource specs are rejected and the migration fails.
+    # With delete-on-failure policy, the target VM is removed — requiring full remigration.
+    # Ref: https://access.redhat.com/solutions/2841971
+
+    - name: Check target namespace ResourceQuota may block MTV pods
+      ansible.builtin.shell: |
+        quotas=$(oc get resourcequota -n {{ target_namespace }} --no-headers 2>/dev/null || true)
+        if [ -n "$quotas" ]; then
+          echo "$quotas" | awk '{print $1}'
+        fi
+      delegate_to: localhost
+      changed_when: false
+      ignore_errors: true
+      register: ns_quota_check
+      failed_when: ns_quota_check.stdout | trim | length > 0
+      when: target_namespace is defined
+
+    # ============ HIGH: Target namespace memory quota insufficient for virt-launcher ============
+    # LESSON LEARNED: Even when a namespace quota exists, it may not have enough free
+    # memory to accommodate the virt-launcher pod overhead (typically 1–8 Gi beyond
+    # the VM's own memory). MTV flags this as a failed migration and — with
+    # delete-on-failure policy — removes the target VM automatically.
+    # Ref: https://access.redhat.com/solutions/7135435
+
+    - name: INFO Target namespace memory quota details
+      ansible.builtin.shell: |
+        oc get resourcequota -n {{ target_namespace }} -o jsonpath='{range .items[*]}{.metadata.name}{": used="}{.status.used.limits\.memory}{" hard="}{.status.hard.limits\.memory}{"\n"}{end}' 2>/dev/null || true
+      delegate_to: localhost
+      changed_when: false
+      ignore_errors: true
+      register: ns_memory_quota_info
+      when: >
+        target_namespace is defined and
+        ns_quota_check is defined and ns_quota_check.stdout | trim | length > 0
+
+    - name: Warn about namespace ResourceQuota — verify sufficient headroom for MTV pods
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: Target namespace '{{ target_namespace }}' has ResourceQuota(s): {{ ns_quota_check.stdout_lines | join(', ') }}.
+          Quota details: {{ ns_memory_quota_info.stdout | default('unavailable') | trim }}.
+          Ensure sufficient CPU/memory headroom exists for MTV helper pods and virt-launcher
+          (typically needs 1–8 Gi overhead). Consider temporarily relaxing the quota during migration.
+      when: >
+        target_namespace is defined and
+        ns_quota_check is defined and ns_quota_check.stdout | trim | length > 0
+      changed_when: false
+
+    # ============ HIGH: Multiple NICs on the same subnet/VLAN ============
+    # LESSON LEARNED: CUDNs automatically generate one NAD per VLAN per namespace.
+    # If a VM has 2+ NICs on the same VLAN, both try to reference the same NAD —
+    # but OCP only allows attaching a given NAD once to a single VM. A second NAD
+    # with identical VLAN config but a different metadata name must be created manually.
+    # Ref: https://access.redhat.com/solutions/7127147
+
+    - name: Check for multiple NICs on the same subnet (same VLAN risk)
+      ansible.windows.win_shell: |
+        $adapters = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+          Where-Object { $_.InterfaceAlias -notmatch 'Loopback' -and $_.PrefixOrigin -ne 'WellKnown' }
+        $subnets = @{}
+        foreach ($a in $adapters) {
+          $prefix = $a.PrefixLength
+          $octets = $a.IPAddress.Split('.')
+          $ip = [UInt32](([UInt32]$octets[0] -shl 24) + ([UInt32]$octets[1] -shl 16) + ([UInt32]$octets[2] -shl 8) + [UInt32]$octets[3])
+          $mask = [UInt32]([UInt32]::MaxValue -shl (32 - $prefix))
+          $netAddr = $ip -band $mask
+          $key = "$netAddr/$prefix"
+          if ($subnets.ContainsKey($key)) {
+            $subnets[$key] += ", $($a.InterfaceAlias)"
+          } else {
+            $subnets[$key] = $a.InterfaceAlias
+          }
+        }
+        $dups = $subnets.GetEnumerator() | Where-Object { $_.Value -match ',' }
+        if ($dups) { $dups | ForEach-Object { "$($_.Key): $($_.Value)" } } else { "" }
+      changed_when: false
+      ignore_errors: true
+      register: dup_vlan_win_check
+      failed_when: dup_vlan_win_check.stdout | trim | length > 0
+
     # ============ AGGREGATION: Report all failures at the end ============
 
     - name: Build failed check list
@@ -532,7 +614,9 @@
               {'label': '[HIGH] VSS provider missing', 'msg': 'Microsoft Software Shadow Copy provider is not registered — shadow copy creation will fail'} if vss_provider_check is defined and 'failed' in vss_provider_check and vss_provider_check.failed else None,
               {'label': '[MEDIUM] Hyper-V role', 'msg': 'Hyper-V role is installed — conflicts with KVM unless nested virtualization is explicitly configured'} if hyperv_check is defined and 'failed' in hyperv_check and hyperv_check.failed else None,
               {'label': '[MEDIUM] Partition table (MBR)', 'msg': 'MBR partition table detected — ' + (partition_win_check.stdout | trim)} if partition_win_check is defined and 'failed' in partition_win_check and partition_win_check.failed else None,
-              {'label': '[LOW] RDP disabled', 'msg': 'RDP is disabled — remote access will not be available after migration'} if rdp_check is defined and 'failed' in rdp_check and rdp_check.failed else None
+              {'label': '[LOW] RDP disabled', 'msg': 'RDP is disabled — remote access will not be available after migration'} if rdp_check is defined and 'failed' in rdp_check and rdp_check.failed else None,
+              {'label': '[HIGH] Namespace ResourceQuota', 'msg': 'Target namespace has ResourceQuota — MTV helper pods and virt-launcher may be rejected. Quota(s): ' + (ns_quota_check.stdout_lines | join(', '))} if ns_quota_check is defined and 'failed' in ns_quota_check and ns_quota_check.failed else None,
+              {'label': '[HIGH] Multiple NICs same VLAN', 'msg': 'Multiple NICs share the same subnet/VLAN — CUDNs generate one NAD per VLAN, manual second NAD required: ' + (dup_vlan_win_check.stdout | trim)} if dup_vlan_win_check is defined and 'failed' in dup_vlan_win_check and dup_vlan_win_check.failed else None
             ] | reject('equalto', None) | list
           }}
 
